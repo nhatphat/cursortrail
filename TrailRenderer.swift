@@ -18,7 +18,6 @@ private struct TrailVertex {
 
 private struct Uniforms {
     var viewport: SIMD2<Float>
-    var viewportOrigin: SIMD2<Float>
     var headWidth: Float
     var widthScale: Float
     var alphaScale: Float
@@ -72,33 +71,6 @@ private final class RingBuffer {
         (head + logicalIndex) % storage.count
     }
 
-    // Walks the live points as at most two contiguous runs: no per-element
-    // modulo, no Double conversions, SIMD min/max only.
-    func bounds() -> CGRect? {
-        guard count > 0 else { return nil }
-        var lo = storage[head].p
-        var hi = lo
-        let firstRun = min(count, storage.count - head)
-        storage.withUnsafeBufferPointer { buf in
-            for i in 0..<firstRun {
-                let p = buf[head + i].p
-                lo = simd_min(lo, p)
-                hi = simd_max(hi, p)
-            }
-            for i in 0..<(count - firstRun) {
-                let p = buf[i].p
-                lo = simd_min(lo, p)
-                hi = simd_max(hi, p)
-            }
-        }
-        return CGRect(
-            x: CGFloat(lo.x),
-            y: CGFloat(lo.y),
-            width: CGFloat(max(1, hi.x - lo.x)),
-            height: CGFloat(max(1, hi.y - lo.y))
-        )
-    }
-
     func removeAll() {
         head = 0
         count = 0
@@ -118,15 +90,24 @@ final class OverlayController {
         self.config = config
         self.mode = mode
 
-        let initialSize = MetalOverlayView.sizeLadder(for: screen)[0]
-        let initialRect = NSRect(
-            x: screen.frame.midX - initialSize.width * 0.5,
-            y: screen.frame.midY - initialSize.height * 0.5,
-            width: initialSize.width,
-            height: initialSize.height
-        )
+        // The overlay covers its whole display and then never moves or resizes.
+        //
+        // A smaller box that chases the cursor is tempting -- it is less to
+        // clear and less for the compositor to blend -- but it cannot be made
+        // correct. The shader places every vertex relative to the window's
+        // origin, so a frame is only right if it reaches the screen in the same
+        // refresh as the `setFrame` it was drawn for. Window geometry travels
+        // to the window server on the CoreAnimation commit; a drawable travels
+        // on the Metal present. Nothing lines the two up, and a CATransaction
+        // around both does not group them either. Every frame still in the
+        // present queue when the window moves is a frame drawn for an origin
+        // that is no longer current, and each one paints the trail up to a
+        // ladder step away from the pointer -- one visible ghost per drawable
+        // in flight. A stationary window makes the origin a constant, which is
+        // the only way the mismatch stops existing.
+        let frame = screen.frame
         let window = NSWindow(
-            contentRect: initialRect,
+            contentRect: frame,
             styleMask: .borderless,
             backing: .buffered,
             defer: false,
@@ -139,10 +120,11 @@ final class OverlayController {
         window.level = .screenSaver
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
 
-        guard let view = MetalOverlayView(frame: NSRect(origin: .zero, size: initialRect.size), device: device, screen: screen, config: config, mode: mode) else {
+        guard let view = MetalOverlayView(frame: NSRect(origin: .zero, size: frame.size), device: device, screen: screen, config: config, mode: mode) else {
             return nil
         }
         window.contentView = view
+        window.setFrame(frame, display: false)
         window.orderFrontRegardless()
 
         self.window = window
@@ -171,38 +153,7 @@ private final class MetalOverlayView: NSView {
     override var wantsUpdateLayer: Bool { true }
     override func makeBackingLayer() -> CALayer { CAMetalLayer() }
 
-    // Moving the overlay window is cheap. *Resizing* it is not: a new
-    // drawableSize throws away the CAMetalLayer's drawable pool, so the next
-    // frame has to allocate fresh IOSurfaces and re-register them with the
-    // render server. Doing that per sample dominated this app's CPU use.
-    //
-    // So the overlay only ever takes one of a few fixed sizes. Normal cursor
-    // motion stays inside the smallest one and never resizes at all; only a
-    // fast flick, whose trail is genuinely longer, promotes to a bigger box.
-    private static let sizeSteps: [CGFloat] = [0.24, 0.40, 0.62, 0.82, 1.0]
-    private static let sizeStepQuantum: CGFloat = 64
-    private static let minViewportSize = CGSize(width: 384, height: 288)
-    /// Frames the trail must stay comfortably inside a smaller box before we
-    /// pay for a shrink. Stops a trail hovering on a boundary from thrashing.
-    private static let shrinkHoldFrames = 45
-    private static let shrinkMargin: CGFloat = 0.75
-    private static let originQuantum: CGFloat = 64
     private static let maxPendingSamples = 24
-
-    /// The candidate overlay sizes for a display, smallest first.
-    static func sizeLadder(for screen: NSScreen) -> [CGSize] {
-        let full = screen.frame.size
-        let q = sizeStepQuantum
-        var ladder: [CGSize] = []
-        for step in sizeSteps {
-            let size = CGSize(
-                width: min(full.width, max(minViewportSize.width, (full.width * step / q).rounded(.up) * q)),
-                height: min(full.height, max(minViewportSize.height, (full.height * step / q).rounded(.up) * q))
-            )
-            if ladder.last != size { ladder.append(size) }
-        }
-        return ladder.isEmpty ? [full] : ladder
-    }
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -211,20 +162,25 @@ private final class MetalOverlayView: NSView {
     private let config: TrailConfig
     private let screen: NSScreen
     private var mode: TrailMode
-    private var viewportRect = CGRect.zero
-    private let sizeLadder: [CGSize]
-    private var sizeIndex = 0
-    private var shrinkFrames = 0
     private let points: RingBuffer
     private let vertexBuffer: MTLBuffer
     private let vertexPointer: UnsafeMutablePointer<TrailVertex>
     private let passDescriptor = MTLRenderPassDescriptor()
+    private let contentScale: Float
     private var lastPoint: SIMD2<Float>?
     private var lastSampleTime: Double = 0
-    private var displayLink: CADisplayLink?
-    private var displayLinkScheduled = false
     private let stateLock = NSLock()
     private let timeOrigin = CACurrentMediaTime()
+
+    // The display link drives rendering from its own thread, so `nextDrawable`
+    // blocking for the rest of a refresh interval -- which it does by design,
+    // that is how vsync pacing works -- no longer holds up the main thread. The
+    // mouse monitors deliver samples there, and on a 75 Hz panel a blocked main
+    // thread meant samples arriving in clumps 13 ms apart instead of evenly:
+    // the trail rendered fine but its shape lurched.
+    private var displayLink: CADisplayLink?
+    private var renderThread: Thread?
+    private var wantsFrames = false
 
     // Samples captured by the event monitors, consumed by the display link.
     private var pending: [TrailPoint]
@@ -233,7 +189,6 @@ private final class MetalOverlayView: NSView {
     // Cached hot-path scalars so the sample gate touches no struct fields.
     private let minSampleDistanceSquared: Float
     private let minSampleInterval: Double
-    private var contentScale: Float
 
     init?(frame: NSRect, device: MTLDevice, screen: NSScreen, config: TrailConfig, mode: TrailMode) {
         self.device = device
@@ -245,7 +200,6 @@ private final class MetalOverlayView: NSView {
         self.minSampleDistanceSquared = config.minSampleDistance * config.minSampleDistance
         self.minSampleInterval = config.minSampleInterval
         self.contentScale = Float(screen.backingScaleFactor)
-        self.sizeLadder = MetalOverlayView.sizeLadder(for: screen)
 
         guard let queue = device.makeCommandQueue() else { return nil }
         self.queue = queue
@@ -280,7 +234,6 @@ private final class MetalOverlayView: NSView {
 
         self.metalLayer = CAMetalLayer()
         super.init(frame: frame)
-        self.viewportRect = CGRect(origin: .zero, size: frame.size)
 
         let color = passDescriptor.colorAttachments[0]!
         color.loadAction = .clear
@@ -295,25 +248,20 @@ private final class MetalOverlayView: NSView {
         metalLayer.framebufferOnly = true
         metalLayer.contentsScale = screen.backingScaleFactor
         metalLayer.drawableSize = CGSize(width: frame.width * screen.backingScaleFactor, height: frame.height * screen.backingScaleFactor)
+        // Two drawables, not three: a deeper queue only buys smoothness when
+        // the render thread might miss a deadline, and this one draws a handful
+        // of triangles. What it costs is latency, and the trail is judged
+        // against a pointer the window server draws with none.
         metalLayer.maximumDrawableCount = 2
 
-        setupDisplayLink(for: screen)
+        // Nothing below reshapes the layer. A backing-scale or resolution change
+        // arrives as NSApplication.didChangeScreenParametersNotification, which
+        // rebuilds every overlay from scratch -- so the render thread is the only
+        // thread that ever touches the layer after this point.
+        startRenderThread()
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func layout() {
-        super.layout()
-        guard let screen = window?.screen else { return }
-        let scale = screen.backingScaleFactor
-        if metalLayer.frame != bounds { metalLayer.frame = bounds }
-        if metalLayer.contentsScale != scale {
-            metalLayer.contentsScale = scale
-            contentScale = Float(scale)
-        }
-        let drawable = CGSize(width: bounds.width * scale, height: bounds.height * scale)
-        if metalLayer.drawableSize != drawable { metalLayer.drawableSize = drawable }
-    }
 
     func beginAt(_ p: SIMD2<Float>) {
         let now = CACurrentMediaTime()
@@ -324,15 +272,13 @@ private final class MetalOverlayView: NSView {
         lastSampleTime = now
         let physical = points.append(TrailPoint(p: p, t: now))
         writeVertexPair(logicalIndex: 0, physicalIndex: physical)
-        let trailBounds = points.bounds()
-        startDisplayLinkUnlocked()
+        requestFramesUnlocked()
         stateLock.unlock()
-        if let trailBounds { updateViewport(for: trailBounds, force: true) }
     }
 
     /// Hot path: called once per mouse event. Does nothing but gate the sample,
-    /// stash it, and make sure the display link is running. All geometry, vertex
-    /// and window work is coalesced into the next `renderFrame`.
+    /// stash it, and make sure the display link is running. All geometry and
+    /// vertex work is coalesced into the next `renderFrame`, on another thread.
     func record(_ p: SIMD2<Float>, force: Bool = false) {
         let now = CACurrentMediaTime()
         stateLock.lock()
@@ -354,7 +300,7 @@ private final class MetalOverlayView: NSView {
             // Absurd event rate: keep the newest sample, drop the previous one.
             pending[pending.count - 1] = TrailPoint(p: p, t: now)
         }
-        startDisplayLinkUnlocked()
+        requestFramesUnlocked()
         stateLock.unlock()
     }
 
@@ -365,16 +311,24 @@ private final class MetalOverlayView: NSView {
     }
 
     func shutdown() {
-        guard let link = displayLink else { return }
-        if displayLinkScheduled {
-            link.remove(from: .main, forMode: .common)
-            displayLinkScheduled = false
+        stateLock.lock()
+        wantsFrames = false
+        displayLink?.isPaused = true
+        stateLock.unlock()
+
+        guard let thread = renderThread else { return }
+        renderThread = nil
+        thread.cancel()
+        if thread.isExecuting {
+            // Break the run loop out of its wait so it notices the cancel and
+            // invalidates the link on the thread that scheduled it.
+            perform(#selector(wakeRenderThread), on: thread, with: nil, waitUntilDone: false, modes: [RunLoop.Mode.default.rawValue])
         }
-        link.invalidate()
-        displayLink = nil
     }
 
-    private func setupDisplayLink(for screen: NSScreen) {
+    @objc private func wakeRenderThread() {}
+
+    private func startRenderThread() {
         let link = screen.displayLink(target: self, selector: #selector(displayLinkFired(_:)))
         if config.maxFPS > 0 {
             let fps = Float(config.maxFPS)
@@ -382,22 +336,49 @@ private final class MetalOverlayView: NSView {
                 minimum: max(1, fps * 0.5), maximum: fps, preferred: fps
             )
         }
+        link.isPaused = true
         displayLink = link
+
+        let thread = Thread { [weak self] in
+            guard let self else { return }
+            let runLoop = RunLoop.current
+            // A run loop with no input source returns from `run` immediately,
+            // which turns the loop below into a spin. This port is never
+            // signalled; it exists so there is something to sleep on while the
+            // display link is paused. `shutdown` wakes the thread with a
+            // `perform(on:)` so the cancel is noticed without polling.
+            runLoop.add(NSMachPort(), forMode: .common)
+            link.add(to: runLoop, forMode: .common)
+
+            // A sample may have landed between `displayLink` being stored and
+            // the link reaching a run loop; honour it rather than sit paused.
+            self.stateLock.lock()
+            link.isPaused = !self.wantsFrames
+            self.stateLock.unlock()
+
+            // Runs in `.default`, never in `.common`: common is a pseudo-mode you
+            // add sources *to*, and asking a run loop to run in it does nothing and
+            // returns false at once. `.default` is itself a common mode, so the link
+            // and the port above -- both registered against common -- fire here.
+            while !Thread.current.isCancelled && runLoop.run(mode: .default, before: .distantFuture) {}
+            link.invalidate()
+        }
+        thread.name = "com.cursortrail.render"
+        thread.qualityOfService = .userInteractive
+        renderThread = thread
+        thread.start()
+    }
+
+    /// Caller must hold `stateLock`. Pausing and unpausing both happen under it
+    /// so a sample arriving as the trail expires cannot be stranded by the
+    /// render thread pausing the link a moment later.
+    private func requestFramesUnlocked() {
+        guard !wantsFrames else { return }
+        wantsFrames = true
+        displayLink?.isPaused = false
     }
 
     @objc private func displayLinkFired(_ sender: CADisplayLink) { renderFrame() }
-
-    private func startDisplayLinkUnlocked() {
-        guard let link = displayLink, !displayLinkScheduled else { return }
-        link.add(to: .main, forMode: .common)
-        displayLinkScheduled = true
-    }
-
-    private func stopDisplayLinkIfIdle() {
-        guard let link = displayLink, displayLinkScheduled else { return }
-        link.remove(from: .main, forMode: .common)
-        displayLinkScheduled = false
-    }
 
     /// Moves the ring forward by every sample the monitors stashed since the
     /// last frame. Returns how many points were appended.
@@ -407,70 +388,6 @@ private final class MetalOverlayView: NSView {
         for i in 0..<n { points.append(pending[i]) }
         pendingCount = 0
         return n
-    }
-
-    private func updateViewport(for trailBounds: CGRect, force: Bool = false) {
-        // The generous padding covers Comet's outer glow.
-        let padding: CGFloat = max(72, CGFloat(mode.headWidth) * 4.0)
-        let localScreen = CGRect(origin: .zero, size: screen.frame.size)
-        let need = trailBounds.insetBy(dx: -padding, dy: -padding).intersection(localScreen)
-        guard !need.isNull else { return }
-
-        let previousIndex = sizeIndex
-        if !fits(need, in: sizeLadder[sizeIndex]) {
-            sizeIndex = sizeLadder.firstIndex { fits(need, in: $0) } ?? (sizeLadder.count - 1)
-            shrinkFrames = 0
-        } else if sizeIndex > 0 {
-            let smaller = sizeLadder[sizeIndex - 1]
-            let margin = Self.shrinkMargin
-            if need.width <= smaller.width * margin && need.height <= smaller.height * margin {
-                shrinkFrames += 1
-                if shrinkFrames >= Self.shrinkHoldFrames {
-                    sizeIndex -= 1
-                    shrinkFrames = 0
-                }
-            } else {
-                shrinkFrames = 0
-            }
-        }
-        let sizeChanged = force || sizeIndex != previousIndex
-        let size = sizeLadder[sizeIndex]
-
-        // Centre the box on the trail, snapped to a coarse grid so the window
-        // only moves every so often, then clamp it to this display.
-        let q = Self.originQuantum
-        let x = min(max(0, ((need.midX - size.width * 0.5) / q).rounded() * q), max(0, localScreen.width - size.width))
-        let y = min(max(0, ((need.midY - size.height * 0.5) / q).rounded() * q), max(0, localScreen.height - size.height))
-        let target = CGRect(x: x, y: y, width: size.width, height: size.height)
-
-        if !sizeChanged {
-            if target == viewportRect { return }
-            // Already covered: no need to chase the cursor every frame.
-            if viewportRect.contains(need) { return }
-        }
-
-        viewportRect = target
-        window?.setFrame(
-            CGRect(
-                x: screen.frame.minX + target.minX,
-                y: screen.frame.minY + target.minY,
-                width: target.width, height: target.height
-            ),
-            display: false
-        )
-
-        // A pure move leaves the drawable pool intact; only a step change on the
-        // size ladder reallocates, and that is rare by construction.
-        if sizeChanged {
-            frame = CGRect(origin: .zero, size: target.size)
-            metalLayer.frame = CGRect(origin: .zero, size: target.size)
-            let scale = metalLayer.contentsScale
-            metalLayer.drawableSize = CGSize(width: target.width * scale, height: target.height * scale)
-        }
-    }
-
-    private func fits(_ rect: CGRect, in size: CGSize) -> Bool {
-        rect.width <= size.width && rect.height <= size.height
     }
 
     private func writeVertexPair(logicalIndex: Int, physicalIndex explicitPhysical: Int? = nil) {
@@ -506,8 +423,11 @@ private final class MetalOverlayView: NSView {
         let count = points.count
 
         if count < 2 {
+            // The last frame with a drawable trail had every point at the end of
+            // its life, so it faded to nothing; there is no stale pixel to clear.
+            wantsFrames = false
+            displayLink?.isPaused = true
             stateLock.unlock()
-            stopDisplayLinkIfIdle()
             return
         }
 
@@ -522,11 +442,8 @@ private final class MetalOverlayView: NSView {
             }
         }
         let vertexStart = points.head * 2
-        let trailBounds = points.bounds()
         let now = Float(nowAbsolute - timeOrigin)
         stateLock.unlock()
-
-        if let trailBounds { updateViewport(for: trailBounds) }
 
         guard let drawable = metalLayer.nextDrawable(),
               let commandBuffer = queue.makeCommandBuffer() else { return }
@@ -540,18 +457,16 @@ private final class MetalOverlayView: NSView {
         encoder.setRenderPipelineState(pipeline)
         encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
 
+        // The window is screen-aligned and stationary, so vertex centres -- which
+        // are display-local points scaled to pixels -- are already drawable
+        // coordinates. No origin to subtract, and nothing to get out of step.
         let viewport = SIMD2(Float(metalLayer.drawableSize.width), Float(metalLayer.drawableSize.height))
-        let viewportOrigin = SIMD2(
-            Float(viewportRect.minX * metalLayer.contentsScale),
-            Float(viewportRect.minY * metalLayer.contentsScale)
-        )
         for passStyle in mode.passes {
             drawPass(
                 encoder: encoder,
                 vertexStart: vertexStart,
                 vertexCount: count * 2,
                 viewport: viewport,
-                viewportOrigin: viewportOrigin,
                 now: now,
                 lifetime: mode.lifetime,
                 headWidth: mode.headWidth,
@@ -567,10 +482,9 @@ private final class MetalOverlayView: NSView {
         attachment.texture = nil
     }
 
-    private func drawPass(encoder: MTLRenderCommandEncoder, vertexStart: Int, vertexCount: Int, viewport: SIMD2<Float>, viewportOrigin: SIMD2<Float>, now: Float, lifetime: Float, headWidth: Float, widthScale: Float, alpha: Float, softness: Float) {
+    private func drawPass(encoder: MTLRenderCommandEncoder, vertexStart: Int, vertexCount: Int, viewport: SIMD2<Float>, now: Float, lifetime: Float, headWidth: Float, widthScale: Float, alpha: Float, softness: Float) {
         var uniforms = Uniforms(
             viewport: viewport,
-            viewportOrigin: viewportOrigin,
             headWidth: headWidth * contentScale,
             widthScale: widthScale,
             alphaScale: alpha,
