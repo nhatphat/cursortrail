@@ -10,7 +10,6 @@ struct TrailVertex {
 
 struct Uniforms {
     float2 viewport;
-    float2 viewportOrigin;
     float headWidth;
     float widthScale;
     float alphaScale;
@@ -36,7 +35,7 @@ vertex RasterOut trailVertex(
     float life = 1.0 - age01;
     float widthCurve = mix(0.16, 1.0, life * life);
     float halfWidth = 0.5 * u.headWidth * u.widthScale * widthCurve;
-    float2 pixel = (v.center - u.viewportOrigin) + v.normal * v.side * halfWidth;
+    float2 pixel = v.center + v.normal * v.side * halfWidth;
 
     float2 ndc;
     ndc.x = (pixel.x / u.viewport.x) * 2.0 - 1.0;
