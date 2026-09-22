@@ -62,7 +62,9 @@ private struct RippleVertex {
     var birthTime: Float
     var maxRadius: Float
     var thickness: Float
-    var lifetime: Float
+    var waveLifetime: Float
+    var waveDelay: Float
+    var waveCount: Float
 }
 
 /// Mirrors `ParticleUniforms` in Trail.metal.
@@ -816,7 +818,9 @@ private final class MetalOverlayView: NSView {
                 birthTime: birth,
                 maxRadius: style.maxRadius * contentScale,
                 thickness: style.thickness * contentScale,
-                lifetime: style.lifetime
+                waveLifetime: style.waveLifetime,
+                waveDelay: style.waveDelay,
+                waveCount: Float(style.waveCount)
             )
             let base = physical * 6
             let mirror = (physical + MetalOverlayView.maxRipples) * 6

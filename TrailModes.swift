@@ -94,11 +94,22 @@ struct TrailStyle {
     }
 }
 
-/// A ring that expands out of a click and fades away.
+/// A train of rings expanding out of a click, each launched a little after the
+/// one before, like a stone dropped in water.
 struct RippleStyle {
     let maxRadius: Float
     let thickness: Float
-    let lifetime: Float
+    /// How long one wave takes to reach `maxRadius`.
+    let waveLifetime: Float
+    /// Gap between successive waves leaving the centre.
+    let waveDelay: Float
+    let waveCount: Int
+
+    /// The last wave leaves after `waveCount - 1` delays and still needs a full
+    /// `waveLifetime` to finish, so the ripple as a whole outlives one wave.
+    var totalLifetime: Float {
+        waveLifetime + Float(max(waveCount - 1, 0)) * waveDelay
+    }
 }
 
 /// An effect that can be switched on independently of the trail's look,
@@ -147,7 +158,7 @@ struct TrailMode {
         emitters.contains { $0.trigger == .click } || !ripples.isEmpty
     }
 
-    var maxRippleLifetime: Float { ripples.map(\.lifetime).max() ?? 0 }
+    var maxRippleLifetime: Float { ripples.map(\.totalLifetime).max() ?? 0 }
 
     /// The ring reclaims a particle's slot by birth order, which is only in
     /// death order when every emitter agrees on a lifetime. Expiring against
@@ -295,7 +306,13 @@ enum TrailEffectRegistry {
     static let rippleEffect = TrailEffect(
         id: "ripple",
         title: "Click Ripple",
-        ripple: RippleStyle(maxRadius: 90, thickness: 7, lifetime: 0.55)
+        ripple: RippleStyle(
+            maxRadius: 130,
+            thickness: 6,
+            waveLifetime: 0.70,
+            waveDelay: 0.12,
+            waveCount: 3
+        )
     )
 
     static func effects(ids: Set<String>) -> [TrailEffect] {

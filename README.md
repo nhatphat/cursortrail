@@ -105,7 +105,7 @@ Effects:
 |---|---|---|
 | **Confetti** | movement | paper thrown off the pointer, fluttering down |
 | **Firework** | a click | 72 sparks radially from the click |
-| **Click Ripple** | a click | a ring that expands out and fades |
+| **Click Ripple** | a click | a train of rings spreading out and fading |
 
 **Blur** has no separate blur pass. Stacking wide, fully soft, nearly transparent strips over each other sums to the same falloff, and each extra pass is one more `drawPrimitives` on a vertex buffer that is already bound — no second render target, no read-back.
 
@@ -117,7 +117,7 @@ The trail is thin where the pointer was crawling and fuller where it was flickin
 
 ## Particle and ripple effects
 
-**Confetti** emits along the pointer's path — one piece per 14 points of travel, so the spacing is a property of the path rather than of the event rate: a slow drag does not carpet the screen and a flick does not leave gaps. **Firework** throws 72 sparks radially from wherever you click. **Click Ripple** expands a ring out of the click, quickly at first and then easing off, so it reads as something the click set off rather than as a growing circle.
+**Confetti** emits along the pointer's path — one piece per 14 points of travel, so the spacing is a property of the path rather than of the event rate: a slow drag does not carpet the screen and a flick does not leave gaps. **Firework** throws 72 sparks radially from wherever you click. **Click Ripple** sends out three rings, each launched a little after the one before, so they chase each other outward the way a stone dropped in water sends them. Each expands quickly and then eases off, fading as it goes, and later waves start fainter so the first stays the leading edge. The quad does not grow: it is fixed at the largest radius and the fragment decides where every ring is, which is what lets one quad carry a whole train of waves instead of one ring each.
 
 A particle's whole path is decided the moment it spawns, so its six vertices are written once and never touched again; position, rotation and fade are evaluated from the vertex's age in the vertex shader. This is the same trick the trail uses for its fade, for the same reason — the CPU does no per-frame particle work, and a frame drawing hundreds of particles is one draw call with no buffer traffic. Ripples work the same way and share the particle uniforms. Motion is ballistic with no drag term: drag has no closed form this cheap, and at these speeds nobody can tell it is missing.
 

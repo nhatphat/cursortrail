@@ -229,17 +229,25 @@ struct RippleVertex {
     float birthTime;
     float maxRadius;
     float thickness;
-    float lifetime;
+    /// How long one wave takes to travel out to `maxRadius`.
+    float waveLifetime;
+    /// Gap between one wave leaving the centre and the next.
+    float waveDelay;
+    float waveCount;
 };
 
 struct RippleRasterOut {
     float4 position [[position]];
     float2 corner;
-    float age01;
-    /// Where the ring sits and how wide it is, both as a fraction of the quad's
-    /// half-extent, so the fragment needs no pixel measurements of its own.
-    float radiusRatio;
-    float thicknessRatio;
+    /// Half-extent of the quad in pixels, so the fragment can turn its corner
+    /// back into a distance from the centre.
+    float extent;
+    float age;
+    float maxRadius;
+    float thickness;
+    float waveLifetime;
+    float waveDelay;
+    float waveCount;
 };
 
 vertex RippleRasterOut rippleVertex(
@@ -248,16 +256,13 @@ vertex RippleRasterOut rippleVertex(
     constant ParticleUniforms &u [[buffer(1)]])
 {
     RippleVertex v = vertices[vid];
-    float t = max(u.now - v.birthTime, 0.0);
-    float age01 = clamp(t / max(v.lifetime, 0.001), 0.0, 1.0);
 
-    // Out fast, then easing off: a ring that expands linearly reads as a
-    // growing circle rather than as something the click set off.
-    float ease = 1.0 - pow(1.0 - age01, 3.0);
-    float radius = v.maxRadius * ease;
-    float outer = max(radius + v.thickness, 0.001);
+    // The quad does not grow. Every wave lives inside one fixed square and the
+    // fragment decides where each ring is, which is what lets a single quad
+    // carry a whole train of waves instead of one ring per quad.
+    float extent = v.maxRadius + v.thickness;
+    float2 pixel = v.origin + v.corner * extent;
 
-    float2 pixel = v.origin + v.corner * outer;
     float2 ndc;
     ndc.x = (pixel.x / u.viewport.x) * 2.0 - 1.0;
     ndc.y = (pixel.y / u.viewport.y) * 2.0 - 1.0;
@@ -265,17 +270,38 @@ vertex RippleRasterOut rippleVertex(
     RippleRasterOut out;
     out.position = float4(ndc, 0.0, 1.0);
     out.corner = v.corner;
-    out.age01 = age01;
-    out.radiusRatio = radius / outer;
-    out.thicknessRatio = v.thickness / outer;
+    out.extent = extent;
+    out.age = max(u.now - v.birthTime, 0.0);
+    out.maxRadius = v.maxRadius;
+    out.thickness = v.thickness;
+    out.waveLifetime = v.waveLifetime;
+    out.waveDelay = v.waveDelay;
+    out.waveCount = v.waveCount;
     return out;
 }
 
 fragment float4 rippleFragment(RippleRasterOut in [[stage_in]], constant ParticleUniforms &u [[buffer(0)]])
 {
-    float d = length(in.corner);
-    float band = abs(d - in.radiusRatio) / max(in.thicknessRatio, 0.001);
-    float shape = 1.0 - smoothstep(0.0, 1.0, band);
-    float life = 1.0 - in.age01;
-    return float4(u.color.rgb, u.color.a * shape * life * life);
+    float radius = length(in.corner) * in.extent;
+    float sum = 0.0;
+
+    // Each wave is the same ring launched a little later, so they chase each
+    // other outward the way a dropped stone sends them.
+    int waves = int(in.waveCount);
+    for (int i = 0; i < waves; ++i) {
+        float age01 = (in.age - float(i) * in.waveDelay) / max(in.waveLifetime, 0.001);
+        if (age01 < 0.0 || age01 > 1.0) { continue; }
+
+        // Out fast, then easing off: a ring that expands linearly reads as a
+        // growing circle rather than as something the click set off.
+        float ease = 1.0 - pow(1.0 - age01, 3.0);
+        float band = abs(radius - in.maxRadius * ease) / max(in.thickness, 0.001);
+        float ring = 1.0 - smoothstep(0.0, 1.0, band);
+        float fade = (1.0 - age01) * (1.0 - age01);
+
+        // Later waves start fainter so the first one stays the leading edge.
+        sum += ring * fade * pow(0.68, float(i));
+    }
+
+    return float4(u.color.rgb, u.color.a * min(sum, 1.0) * 0.9);
 }
