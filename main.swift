@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import Foundation
 import Metal
 import QuartzCore
@@ -64,13 +65,20 @@ enum TrailColorPresets {
 
 @main
 final class CursorTrailApp: NSObject, NSApplicationDelegate {
-    private static let modeDefaultsKey = "selectedTrailMode"
+    private static let styleDefaultsKey = "selectedTrailStyle"
+    private static let effectsDefaultsKey = "selectedTrailEffects"
+    private static let legacyModeDefaultsKey = "selectedTrailMode"
     private static let colorDefaultsKey = "trailColor"
     private static let burstClicksDefaultsKey = "burstClicks"
+    private static let paletteDefaultsKey = "particlePalette"
     private static let burstClickChoices = [1, 2, 3]
 
     private let config = TrailConfig()
-    private var currentMode = TrailModeRegistry.defaultMode
+    private var currentStyle = TrailStyleRegistry.defaultStyle
+    private var currentEffectIDs: Set<String> = []
+    private var currentMode: TrailMode {
+        TrailMode(style: currentStyle, effects: TrailEffectRegistry.effects(ids: currentEffectIDs))
+    }
     private var currentColor = SIMD4<Float>(0, 0, 0, 0)
     private var overlays: [OverlayController] = []
     private var globalMonitor: Any?
@@ -79,10 +87,22 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     private var localClickMonitor: Any?
     private var activeOverlay: OverlayController?
     private var statusItem: NSStatusItem?
-    private var modeMenuItems: [String: NSMenuItem] = [:]
+    private var styleMenuItems: [String: NSMenuItem] = [:]
+    private var effectMenuItems: [String: NSMenuItem] = [:]
     private var colorMenuItems: [NSMenuItem] = []
     private var burstClicksMenuItems: [NSMenuItem] = []
     private var burstNoteItem: NSMenuItem?
+    private var paletteMenuItems: [String: NSMenuItem] = [:]
+    private var pauseMenuItem: NSMenuItem?
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
+    /// Paused means "stop feeding the overlays". Nothing is torn down and
+    /// nothing is cleared by force: whatever is on screen expires on its own
+    /// within a second and the existing stop path parks the display link. A
+    /// hard clear would have to paint one empty frame first, and fading out is
+    /// what you want from a key you hit mid-presentation anyway.
+    private var trailEnabled = true
+    private var currentPalette = ParticlePaletteRegistry.defaultPalette
     private var currentBurstClicks = 1
     /// Shown only while the active mode generates its own hues, so the swatches
     /// having no visible effect reads as intended rather than broken.
@@ -97,10 +117,11 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        currentMode = TrailModeRegistry.mode(id: UserDefaults.standard.string(forKey: Self.modeDefaultsKey))
+        restoreSelection()
         // The environment variable is the default, not an override: a colour
         // picked from the menu bar has been chosen more deliberately.
         currentColor = Self.decodeColor(UserDefaults.standard.string(forKey: Self.colorDefaultsKey)) ?? config.color
+        currentPalette = ParticlePaletteRegistry.palette(id: UserDefaults.standard.string(forKey: Self.paletteDefaultsKey))
         let storedClicks = UserDefaults.standard.integer(forKey: Self.burstClicksDefaultsKey)
         currentBurstClicks = Self.burstClickChoices.contains(storedClicks)
             ? storedClicks
@@ -108,6 +129,7 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         setupStatusItem()
         rebuildOverlays()
         installMouseMonitors()
+        installHotKey()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensChanged),
@@ -116,11 +138,39 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         )
     }
 
+    /// Styles and effects used to be one list of fixed combinations, so a
+    /// stored "confetti" or "party" has to be split back into the two axes it
+    /// was always made of.
+    private func restoreSelection() {
+        let defaults = UserDefaults.standard
+        if let styleID = defaults.string(forKey: Self.styleDefaultsKey) {
+            currentStyle = TrailStyleRegistry.style(id: styleID)
+            let stored = defaults.stringArray(forKey: Self.effectsDefaultsKey) ?? []
+            currentEffectIDs = Set(stored).intersection(TrailEffectRegistry.all.map(\.id))
+            return
+        }
+
+        switch defaults.string(forKey: Self.legacyModeDefaultsKey) {
+        case "confetti": currentStyle = TrailStyleRegistry.style(id: "comet"); currentEffectIDs = ["confetti"]
+        case "firework": currentStyle = TrailStyleRegistry.style(id: "comet"); currentEffectIDs = ["firework"]
+        case "party": currentStyle = TrailStyleRegistry.style(id: "comet"); currentEffectIDs = ["confetti", "firework"]
+        case let other: currentStyle = TrailStyleRegistry.style(id: other)
+        }
+        persistSelection()
+    }
+
+    private func persistSelection() {
+        UserDefaults.standard.set(currentStyle.id, forKey: Self.styleDefaultsKey)
+        UserDefaults.standard.set(Array(currentEffectIDs).sorted(), forKey: Self.effectsDefaultsKey)
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
         if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
         if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
+        if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
+        if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
     }
 
     @objc private func screensChanged() {
@@ -135,16 +185,31 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         }
 
         let menu = NSMenu()
-        let header = NSMenuItem(title: "Trail Mode", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
+        let styleHeader = NSMenuItem(title: "Trail Style", action: nil, keyEquivalent: "")
+        styleHeader.isEnabled = false
+        menu.addItem(styleHeader)
 
-        for mode in TrailModeRegistry.all {
-            let modeItem = NSMenuItem(title: mode.title, action: #selector(selectMode(_:)), keyEquivalent: "")
-            modeItem.target = self
-            modeItem.representedObject = mode.id
-            menu.addItem(modeItem)
-            modeMenuItems[mode.id] = modeItem
+        for style in TrailStyleRegistry.all {
+            let item = NSMenuItem(title: style.title, action: #selector(selectStyle(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = style.id
+            menu.addItem(item)
+            styleMenuItems[style.id] = item
+        }
+
+        menu.addItem(.separator())
+        let effectHeader = NSMenuItem(title: "Effects", action: nil, keyEquivalent: "")
+        effectHeader.isEnabled = false
+        menu.addItem(effectHeader)
+
+        // Checks, not a choice: every combination of these is reachable, and
+        // combining them with any style above is the whole point.
+        for effect in TrailEffectRegistry.all {
+            let item = NSMenuItem(title: effect.title, action: #selector(toggleEffect(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = effect.id
+            menu.addItem(item)
+            effectMenuItems[effect.id] = item
         }
 
         menu.addItem(.separator())
@@ -152,11 +217,21 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         colorItem.submenu = buildColorMenu()
         menu.addItem(colorItem)
 
+        let paletteItem = NSMenuItem(title: "Particle Colors", action: nil, keyEquivalent: "")
+        paletteItem.submenu = buildPaletteMenu()
+        menu.addItem(paletteItem)
+
         let burstItem = NSMenuItem(title: "Firework Clicks", action: nil, keyEquivalent: "")
         burstItem.submenu = buildBurstMenu()
         menu.addItem(burstItem)
 
         menu.addItem(.separator())
+        let pause = NSMenuItem(title: "Pause Trail", action: #selector(togglePause), keyEquivalent: "t")
+        pause.keyEquivalentModifierMask = [.control, .option, .command]
+        pause.target = self
+        menu.addItem(pause)
+        pauseMenuItem = pause
+
         let quit = NSMenuItem(title: "Quit CursorTrail", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -166,6 +241,33 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         refreshModeChecks()
         refreshColorChecks()
         refreshBurstChecks()
+        refreshPaletteChecks()
+    }
+
+    private func buildPaletteMenu() -> NSMenu {
+        let menu = NSMenu()
+        for palette in ParticlePaletteRegistry.all {
+            let item = NSMenuItem(title: palette.title, action: #selector(selectPalette(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = palette.id
+            menu.addItem(item)
+            paletteMenuItems[palette.id] = item
+        }
+        return menu
+    }
+
+    @objc private func selectPalette(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        currentPalette = ParticlePaletteRegistry.palette(id: id)
+        UserDefaults.standard.set(currentPalette.id, forKey: Self.paletteDefaultsKey)
+        overlays.forEach { $0.setPalette(currentPalette) }
+        refreshPaletteChecks()
+    }
+
+    private func refreshPaletteChecks() {
+        for (id, item) in paletteMenuItems {
+            item.state = (id == currentPalette.id) ? .on : .off
+        }
     }
 
     private func buildBurstMenu() -> NSMenu {
@@ -201,9 +303,9 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
             guard let clicks = item.representedObject as? Int else { continue }
             item.state = (clicks == currentBurstClicks) ? .on : .off
         }
-        let modeBursts = currentMode.emitters.contains { $0.trigger == .click }
+        let modeBursts = currentMode.hasBurstEffect
         burstNoteItem?.isHidden = modeBursts
-        burstNoteItem?.title = "\(currentMode.title) has no burst"
+        burstNoteItem?.title = "Turn on Firework to use this"
     }
 
     private func buildColorMenu() -> NSMenu {
@@ -280,7 +382,7 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
             item.state = Self.colorsMatch(rgba, currentColor) ? .on : .off
         }
         colorNoteItem?.isHidden = currentMode.usesTrailColor
-        colorNoteItem?.title = "\(currentMode.title) picks its own colors"
+        colorNoteItem?.title = "\(currentStyle.title) picks its own colors"
     }
 
     private static func colorsMatch(_ a: SIMD4<Float>, _ b: SIMD4<Float>) -> Bool {
@@ -314,20 +416,80 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         return SIMD4(parts[0], parts[1], parts[2], parts[3])
     }
 
-    @objc private func selectMode(_ sender: NSMenuItem) {
+    @objc private func selectStyle(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        let mode = TrailModeRegistry.mode(id: id)
-        currentMode = mode
-        UserDefaults.standard.set(mode.id, forKey: Self.modeDefaultsKey)
+        currentStyle = TrailStyleRegistry.style(id: id)
+        applySelection()
+    }
+
+    @objc private func toggleEffect(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        if currentEffectIDs.contains(id) {
+            currentEffectIDs.remove(id)
+        } else {
+            currentEffectIDs.insert(id)
+        }
+        applySelection()
+    }
+
+    private func applySelection() {
+        persistSelection()
+        let mode = currentMode
         overlays.forEach { $0.setMode(mode) }
         refreshModeChecks()
         refreshColorChecks()
         refreshBurstChecks()
+        refreshPaletteChecks()
     }
 
     private func refreshModeChecks() {
-        for (id, item) in modeMenuItems {
-            item.state = (id == currentMode.id) ? .on : .off
+        for (id, item) in styleMenuItems {
+            item.state = (id == currentStyle.id) ? .on : .off
+        }
+        for (id, item) in effectMenuItems {
+            item.state = currentEffectIDs.contains(id) ? .on : .off
+        }
+    }
+
+    /// Carbon rather than an NSEvent key monitor: a global monitor for key
+    /// events needs Accessibility permission, and a hotkey registration does
+    /// not. The handler takes no captured state, which is what lets it be a
+    /// plain C function pointer.
+    private func installHotKey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, _, userData in
+                guard let userData else { return noErr }
+                Unmanaged<CursorTrailApp>.fromOpaque(userData).takeUnretainedValue().setPaused(toggle: true)
+                return noErr
+            },
+            1,
+            &spec,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &hotKeyHandler
+        )
+
+        let id = EventHotKeyID(signature: OSType(0x43545241), id: 1)
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_T),
+            UInt32(controlKey | optionKey | cmdKey),
+            id,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+    }
+
+    @objc private func togglePause() { setPaused(toggle: true) }
+
+    /// Reached from the hotkey handler, which is not on any particular thread.
+    fileprivate func setPaused(toggle: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if toggle { self.trailEnabled.toggle() }
+            self.pauseMenuItem?.title = self.trailEnabled ? "Pause Trail" : "Resume Trail"
+            if !self.trailEnabled { self.activeOverlay = nil }
         }
     }
 
@@ -337,7 +499,9 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
 
     private func rebuildOverlays() {
         overlays.forEach { $0.shutdown() }
-        overlays = NSScreen.screens.compactMap { OverlayController(screen: $0, config: config, mode: currentMode, color: currentColor) }
+        let mode = currentMode
+        overlays = NSScreen.screens.compactMap { OverlayController(screen: $0, config: config, mode: mode, color: currentColor) }
+        overlays.forEach { $0.setPalette(currentPalette) }
         activeOverlay = nil
     }
 
@@ -367,6 +531,7 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     }
 
     private func handleClick(_ event: NSEvent) {
+        guard trailEnabled else { return }
         // Which counts matter is the active mode's business, not this monitor's.
         let clicks = event.clickCount
         guard clicks > 0 else { return }
@@ -380,6 +545,7 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     }
 
     private func sampleMouse(force: Bool = false) {
+        guard trailEnabled else { return }
         let global = NSEvent.mouseLocation
 
         // The pointer almost always stays on the display it was on last frame,

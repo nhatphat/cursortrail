@@ -9,7 +9,8 @@ A tiny, native macOS cursor-trail utility focused on low overhead, smooth render
 - Fixed-capacity ring buffer for trail samples
 - Shared Metal vertex buffer; no per-frame trail arrays
 - Native menu bar mode and colour pickers, both persistent
-- Eight built-in modes, including particle modes: **Confetti**, **Firework** and **Party**
+- Trail style and particle effects are independent: pick one style, tick any effects
+- Pointer speed drives trail width; global hotkey to pause
 - Mode registry designed so new modes can be added without changing the input/render core
 - Transparent click-through overlay per display
 - Only a display that currently has a fading trail renders
@@ -82,40 +83,63 @@ Remove it with:
 ./uninstall.sh
 ```
 
-## Trail modes
+## Trail styles and effects
 
-Choose the active mode from the menu bar icon. The selection is stored in `UserDefaults` and restored on the next launch.
+Choose them from the menu bar icon. Selections are stored in `UserDefaults` and restored on the next launch.
 
-Built-in modes:
+CursorTrail has two independent axes, and the menu bar reflects that: **Trail Style** is a single choice, **Effects** are checks. Any style combines with any set of effects.
 
-| Mode | Look | Passes | Colour |
+Styles:
+
+| Style | Look | Passes | Colour |
 |---|---|---:|---|
 | **Comet** | the original Ghostty-like glowing trail | 3 | your colour |
 | **Line** | a thin, understated line along the pointer path | 1 | your colour |
 | **Rainbow Road** | hues sweep down the trail and scroll over time | 3 | its own |
 | **Gradient** | your colour at the head, fading into a hue-rotated tail | 2 | your colour |
 | **Blur** | a wide, diffuse smudge with no hard edge | 5 | your colour |
-| **Confetti** | paper thrown off the pointer as it moves, fluttering down | 2 + particles | its own |
-| **Firework** | a burst of sparks when you click | 2 + particles | its own |
-| **Party** | both at once: paper as you move, sparks when you click | 2 + particles | its own |
+
+Effects:
+
+| Effect | Fires on | What it does |
+|---|---|---|
+| **Confetti** | movement | paper thrown off the pointer, fluttering down |
+| **Firework** | a click | 72 sparks radially from the click |
+| **Click Ripple** | a click | a ring that expands out and fades |
 
 **Blur** has no separate blur pass. Stacking wide, fully soft, nearly transparent strips over each other sums to the same falloff, and each extra pass is one more `drawPrimitives` on a vertex buffer that is already bound — no second render target, no read-back.
 
 **Rainbow Road** picks its hue from how far down the trail a fragment sits, so the pattern is anchored to the pointer and scrolls with time rather than with position on screen. **Gradient** derives its tail colour by rotating your chosen colour's hue; pick a near-grey and it lifts the saturation so the tail is still a visibly different colour.
 
-## Particle modes
+## Trail width follows pointer speed
 
-**Confetti** emits along the pointer's path — one piece per 14 points of travel, so the spacing is a property of the path rather than of the event rate: a slow drag does not carpet the screen and a flick does not leave gaps. **Firework** throws 72 sparks radially from wherever you click. **Party** runs both emitters at once. All three keep drawing their trail underneath.
+The trail is thin where the pointer was crawling and fuller where it was flicking. The speed is recorded **per sample**, not applied per frame: a single multiplier on the whole trail would make the part drawn a second ago swell and shrink along with the pointer's current speed, which reads as breathing. A mode sets how much of its width it hands over with `speedResponse`; **Line** sets it to zero, because a hairline that swells stops reading as a line.
 
-A mode carries a list of emitters rather than one, which is what lets Party throw fluttering paper and round sparks together. The two disagree about lifetime, gravity and shape, so those live on the particle rather than in the uniforms — one buffer, one draw call, however many emitters a mode declares.
+## Particle and ripple effects
 
-A particle's whole path is decided the moment it spawns, so its six vertices are written once and never touched again; position, rotation and fade are evaluated from the vertex's age in the vertex shader. This is the same trick the trail uses for its fade, for the same reason — the CPU does no per-frame particle work, and a frame drawing hundreds of particles is one draw call with no buffer traffic. Motion is ballistic with no drag term: drag has no closed form this cheap, and at these speeds nobody can tell it is missing.
+**Confetti** emits along the pointer's path — one piece per 14 points of travel, so the spacing is a property of the path rather than of the event rate: a slow drag does not carpet the screen and a flick does not leave gaps. **Firework** throws 72 sparks radially from wherever you click. **Click Ripple** expands a ring out of the click, quickly at first and then easing off, so it reads as something the click set off rather than as a growing circle.
+
+A particle's whole path is decided the moment it spawns, so its six vertices are written once and never touched again; position, rotation and fade are evaluated from the vertex's age in the vertex shader. This is the same trick the trail uses for its fade, for the same reason — the CPU does no per-frame particle work, and a frame drawing hundreds of particles is one draw call with no buffer traffic. Ripples work the same way and share the particle uniforms. Motion is ballistic with no drag term: drag has no closed form this cheap, and at these speeds nobody can tell it is missing.
+
+Physics rides on the particle rather than in the uniforms, which is what lets several effects with different lifetimes, gravity and shape be drawn together in one call.
 
 Gravity is well under the real thing. At anything like a realistic value the confetti drops some 600 points inside its lifetime — more than half a display — and reads as being sucked downward rather than fluttering.
 
+## Particle colours
+
+The **Particle Colors** submenu sets where every effect gets its hues: **Rainbow** (the whole wheel), **Warm**, **Cool**, **Pastel** (any hue, low saturation) or **Trail Color** (the colour you picked, no hue of its own). Narrow bands read as a deliberate scheme rather than as confetti from a party shop, which is the reason the setting exists.
+
+## Pausing
+
+**⌃⌥⌘T** pauses and resumes the trail from anywhere, and the menu bar carries the same item. Useful when you are about to share your screen.
+
+Pausing only stops feeding the overlays. Nothing is cleared by force: whatever is on screen expires on its own within a second, and the existing stop path parks the display link. A hard clear would have to paint one empty frame first, and fading out is what you want from a key you hit mid-presentation anyway.
+
+The hotkey is registered with Carbon's `RegisterEventHotKey` rather than an `NSEvent` key monitor, because a global monitor for key events needs Accessibility permission and a hotkey registration does not.
+
 ### Choosing the click gesture
 
-The menu bar has a **Firework Clicks** submenu: **Single Click**, **2 Clicks** or **3 Clicks**. The choice is stored in `UserDefaults` and restored next launch, and it applies to whichever mode is emitting bursts.
+The menu bar has a **Firework Clicks** submenu: **Single Click**, **2 Clicks** or **3 Clicks**. The choice is stored in `UserDefaults` and restored next launch, and it applies to every click-triggered effect.
 
 Single click is the default and it means *every* click — on a button, in a menu, on a text field. That is a lot of fireworks. Two or three clicks is quieter, at the cost of overlapping real gestures: triple click selects a paragraph in most editors, so bursts will follow text selection.
 
@@ -123,7 +147,7 @@ Detection uses AppKit's own `clickCount`, which is already measured against your
 
 ### Adding another mode
 
-Modes are declared in `TrailModes.swift`. Add one `TrailMode` entry to `TrailModeRegistry.all`; the menu bar is generated automatically. A mode controls its lifetime, width, its colouring (`.solid`, `.gradient`, `.rainbow`), one-or-more GPU passes, and any number of `ParticleStyle` emitters. The mouse monitoring, ring buffer, display-link lifecycle, and overlay code do not need to change.
+Styles and effects are declared in `TrailModes.swift`. Add a `TrailStyle` to `TrailStyleRegistry.all` or a `TrailEffect` to `TrailEffectRegistry.all`; the menu bar is generated from both, and because the two axes are independent a new entry needs no combination entry anywhere. A style controls lifetime, width, colouring (`.solid`, `.gradient`, `.rainbow`), speed response and its GPU passes. An effect carries a `ParticleStyle`, a `RippleStyle`, or both. The mouse monitoring, ring buffer, display-link lifecycle, and overlay code do not need to change.
 
 A genuinely new *kind* of colouring needs one more branch in `trailFragment` and one more case in `TrailColoring`. That enum's raw values are the wire format of the `coloring` uniform, so they cannot be renumbered on their own.
 

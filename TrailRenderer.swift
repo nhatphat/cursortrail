@@ -7,6 +7,8 @@ import simd
 private struct TrailPoint {
     var p: SIMD2<Float>
     var t: Double
+    /// Pointer speed when this point was sampled, already normalised to 0...1.
+    var speed01: Float = 0
 }
 
 private struct TrailVertex {
@@ -14,6 +16,7 @@ private struct TrailVertex {
     var normal: SIMD2<Float>
     var side: Float
     var birthTime: Float
+    var speed01: Float
 }
 
 /// Mirrors `Uniforms` in Trail.metal field for field, including `pad`. Both
@@ -27,6 +30,7 @@ private struct Uniforms {
     var glowSoftness: Float
     var now: Float
     var lifetime: Float
+    var speedResponse: Float
     var hueSpread: Float
     var hueSpeed: Float
     var coloring: UInt32
@@ -44,10 +48,21 @@ private struct ParticleVertex {
     var size: Float
     var spin: Float
     var corner: SIMD2<Float>
+    var saturation: Float
     var gravity: Float
     var lifetime: Float
     var roundness: Float
     var flutter: Float
+}
+
+/// Mirrors `RippleVertex` in Trail.metal.
+private struct RippleVertex {
+    var origin: SIMD2<Float>
+    var corner: SIMD2<Float>
+    var birthTime: Float
+    var maxRadius: Float
+    var thickness: Float
+    var lifetime: Float
 }
 
 /// Mirrors `ParticleUniforms` in Trail.metal.
@@ -242,6 +257,8 @@ final class OverlayController {
 
     func setColor(_ color: SIMD4<Float>) { view.setColor(color) }
 
+    func setPalette(_ palette: ParticlePalette) { view.setPalette(palette) }
+
     func burst(globalPoint: CGPoint, clickCount: Int, wantedClicks: Int) {
         view.burst(at: localPoint(globalPoint), clickCount: clickCount, wantedClicks: wantedClicks)
     }
@@ -274,10 +291,19 @@ private final class MetalOverlayView: NSView {
     /// the mode changes, so the render thread never does hue maths per frame.
     private var trailColor: SIMD4<Float>
     private var tailColor: SIMD4<Float>
+    private var palette = ParticlePaletteRegistry.defaultPalette
     private let points: RingBuffer
     private let vertexBuffer: MTLBuffer
     private let vertexPointer: UnsafeMutablePointer<TrailVertex>
     private let particlePipeline: MTLRenderPipelineState
+    private let ripplePipeline: MTLRenderPipelineState
+    /// Ripples are one per click, so a handful is plenty; the same ring and
+    /// mirrored-buffer scheme as particles, at a much smaller capacity.
+    private let ripples: ParticleRing
+    private let rippleBuffer: MTLBuffer
+    private let ripplePointer: UnsafeMutablePointer<RippleVertex>
+    private var pendingRipples: [SIMD2<Float>] = []
+    private static let maxRipples = 24
     private let particles: ParticleRing
     private let particleBuffer: MTLBuffer
     private let particlePointer: UnsafeMutablePointer<ParticleVertex>
@@ -325,6 +351,10 @@ private final class MetalOverlayView: NSView {
     private var pointerSpeed: Float = 0
     private static let promoteSpeed: Float = 700
     private static let demoteSpeed: Float = 400
+    /// Pointer speed, in points per second, that counts as "flat out" for the
+    /// width response. Picked from the tier thresholds above: a touch beyond
+    /// the speed that already promotes the display link to full rate.
+    private static let fullWidthSpeed: Float = 1400
 
     // Samples captured by the event monitors, consumed by the display link.
     private var pending: [TrailPoint]
@@ -360,6 +390,7 @@ private final class MetalOverlayView: NSView {
         self.tailColor = TrailColorMath.rotatingHue(of: color, by: mode.tailHueShift)
         self.points = RingBuffer(capacity: config.maxPoints)
         self.particles = ParticleRing(capacity: config.maxParticles)
+        self.ripples = ParticleRing(capacity: MetalOverlayView.maxRipples)
         // Seeded off the screen's position so two displays do not throw
         // identical confetti. `truncatingIfNeeded` rather than `Int64(...)`:
         // that one is a checked conversion, and a display sitting at a negative
@@ -391,11 +422,18 @@ private final class MetalOverlayView: NSView {
         self.particleBuffer = pb
         self.particlePointer = pb.contents().bindMemory(to: ParticleVertex.self, capacity: maxParticleVertices)
 
+        let maxRippleVertices = MetalOverlayView.maxRipples * 12
+        guard let rb = device.makeBuffer(length: MemoryLayout<RippleVertex>.stride * maxRippleVertices, options: [.storageModeShared]) else { return nil }
+        self.rippleBuffer = rb
+        self.ripplePointer = rb.contents().bindMemory(to: RippleVertex.self, capacity: maxRippleVertices)
+
         guard let library = MetalOverlayView.loadLibrary(device: device),
               let vertex = library.makeFunction(name: "trailVertex"),
               let fragment = library.makeFunction(name: "trailFragment"),
               let particleVertex = library.makeFunction(name: "particleVertex"),
-              let particleFragment = library.makeFunction(name: "particleFragment") else { return nil }
+              let particleFragment = library.makeFunction(name: "particleFragment"),
+              let rippleVertex = library.makeFunction(name: "rippleVertex"),
+              let rippleFragment = library.makeFunction(name: "rippleFragment") else { return nil }
 
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction = vertex
@@ -422,6 +460,15 @@ private final class MetalOverlayView: NSView {
             self.particlePipeline = try device.makeRenderPipelineState(descriptor: desc)
         } catch {
             fputs("CursorTrail: particle pipeline creation failed: \(error)\n", stderr)
+            return nil
+        }
+
+        desc.vertexFunction = rippleVertex
+        desc.fragmentFunction = rippleFragment
+        do {
+            self.ripplePipeline = try device.makeRenderPipelineState(descriptor: desc)
+        } catch {
+            fputs("CursorTrail: ripple pipeline creation failed: \(error)\n", stderr)
             return nil
         }
 
@@ -514,12 +561,13 @@ private final class MetalOverlayView: NSView {
 
         lastPoint = p
         lastSampleTime = now
+        let speed01 = min(pointerSpeed / MetalOverlayView.fullWidthSpeed, 1)
         if pendingCount < pending.count {
-            pending[pendingCount] = TrailPoint(p: p, t: now)
+            pending[pendingCount] = TrailPoint(p: p, t: now, speed01: speed01)
             pendingCount += 1
         } else {
             // Absurd event rate: keep the newest sample, drop the previous one.
-            pending[pending.count - 1] = TrailPoint(p: p, t: now)
+            pending[pending.count - 1] = TrailPoint(p: p, t: now, speed01: speed01)
         }
         requestFramesUnlocked()
         stateLock.unlock()
@@ -530,13 +578,21 @@ private final class MetalOverlayView: NSView {
     /// installed for every mode.
     func burst(at p: SIMD2<Float>, clickCount: Int, wantedClicks: Int) {
         stateLock.lock()
-        guard clickCount == wantedClicks,
-              let index = mode.emitters.firstIndex(where: { $0.trigger == .click }) else {
+        guard clickCount == wantedClicks else {
             stateLock.unlock()
             return
         }
-        queueSpawnUnlocked(SpawnRequest(p: p, count: mode.emitters[index].burstCount, burst: true, emitter: index))
-        requestFramesUnlocked()
+
+        var answered = false
+        if let index = mode.emitters.firstIndex(where: { $0.trigger == .click }) {
+            queueSpawnUnlocked(SpawnRequest(p: p, count: mode.emitters[index].burstCount, burst: true, emitter: index))
+            answered = true
+        }
+        if !mode.ripples.isEmpty, pendingRipples.count < MetalOverlayView.maxRipples {
+            pendingRipples.append(p)
+            answered = true
+        }
+        if answered { requestFramesUnlocked() }
         stateLock.unlock()
     }
 
@@ -561,8 +617,16 @@ private final class MetalOverlayView: NSView {
         // Confetti already in the air belongs to the mode that threw it, and
         // it would be wrong to keep drawing it with the new mode's physics.
         particles.removeAll()
+        ripples.removeAll()
         emissionCarry = 0
         pendingSpawns.removeAll(keepingCapacity: true)
+        pendingRipples.removeAll(keepingCapacity: true)
+        stateLock.unlock()
+    }
+
+    func setPalette(_ palette: ParticlePalette) {
+        stateLock.lock()
+        self.palette = palette
         stateLock.unlock()
     }
 
@@ -707,12 +771,19 @@ private final class MetalOverlayView: NSView {
                     origin: request.p * contentScale,
                     velocity: velocity,
                     birthTime: birth,
-                    hue: style.randomHue ? random.next01() : -1,
+                    // `randomHue` says the effect wants a colour of its own;
+                    // the palette says which. A palette of the trail colour is
+                    // the -1 sentinel the shader already understood.
+                    hue: (style.randomHue && !palette.usesTrailColor)
+                        ? (palette.hueStart + random.next01() * palette.hueSpan)
+                            .truncatingRemainder(dividingBy: 1)
+                        : -1,
                     // Vary the size a little: identical confetti reads as a
                     // texture rather than as separate pieces of paper.
                     size: style.size * contentScale * (0.7 + 0.6 * random.next01()),
                     spin: spin,
                     corner: .zero,
+                    saturation: palette.saturation,
                     gravity: style.gravity * contentScale,
                     lifetime: style.lifetime,
                     roundness: style.roundness,
@@ -732,6 +803,33 @@ private final class MetalOverlayView: NSView {
         pendingSpawns.removeAll(keepingCapacity: true)
     }
 
+    /// Caller must hold `stateLock`; runs on the render thread.
+    private func drainRipplesUnlocked(style: RippleStyle, nowAbsolute: Double) {
+        guard !pendingRipples.isEmpty else { return }
+        let birth = Float(nowAbsolute - timeOrigin)
+
+        for origin in pendingRipples {
+            let physical = ripples.append(birthTime: nowAbsolute)
+            let vertex = RippleVertex(
+                origin: origin * contentScale,
+                corner: .zero,
+                birthTime: birth,
+                maxRadius: style.maxRadius * contentScale,
+                thickness: style.thickness * contentScale,
+                lifetime: style.lifetime
+            )
+            let base = physical * 6
+            let mirror = (physical + MetalOverlayView.maxRipples) * 6
+            for i in 0..<6 {
+                var v = vertex
+                v.corner = MetalOverlayView.quadCorners[i]
+                ripplePointer[base + i] = v
+                ripplePointer[mirror + i] = v
+            }
+        }
+        pendingRipples.removeAll(keepingCapacity: true)
+    }
+
     private func writeVertexPair(logicalIndex: Int, physicalIndex explicitPhysical: Int? = nil) {
         guard logicalIndex >= 0, logicalIndex < points.count else { return }
         let physical = explicitPhysical ?? points.physicalIndex(logicalIndex)
@@ -747,8 +845,8 @@ private final class MetalOverlayView: NSView {
         let center = current.p * contentScale
         let pair = physical * 2
         let mirrorPair = (physical + config.maxPoints) * 2
-        let left = TrailVertex(center: center, normal: normal, side: -1, birthTime: birth)
-        let right = TrailVertex(center: center, normal: normal, side: 1, birthTime: birth)
+        let left = TrailVertex(center: center, normal: normal, side: -1, birthTime: birth, speed01: current.speed01)
+        let right = TrailVertex(center: center, normal: normal, side: 1, birthTime: birth, speed01: current.speed01)
         vertexPointer[pair] = left
         vertexPointer[pair + 1] = right
         vertexPointer[mirrorPair] = left
@@ -772,13 +870,22 @@ private final class MetalOverlayView: NSView {
         } else if particles.count > 0 {
             particles.removeAll()
         }
+        if let style = mode.ripples.first {
+            ripples.removeExpired(before: nowAbsolute - Double(mode.maxRippleLifetime))
+            drainRipplesUnlocked(style: style, nowAbsolute: nowAbsolute)
+        } else if ripples.count > 0 {
+            ripples.removeAll()
+        }
+
         let particleCount = particles.count
         let particleStart = particles.head * 6
+        let rippleCount = ripples.count
+        let rippleStart = ripples.head * 6
 
         // A frame with no new sample means the pointer has stopped or is
         // crawling; let the average fall so the fade-out settles at half rate.
         if appended == 0 { pointerSpeed *= 0.7 }
-        if particleCount > 0 {
+        if particleCount > 0 || rippleCount > 0 {
             // Particles are the one thing on screen that moves independently of
             // the pointer, and sparks cross a display far faster than a pointer
             // ever does. Half rate would strobe them, so hold full rate until
@@ -793,7 +900,7 @@ private final class MetalOverlayView: NSView {
         }
 
         let drawTrail = count >= 2
-        if !drawTrail && particleCount == 0 {
+        if !drawTrail && particleCount == 0 && rippleCount == 0 {
             // The last frame with a drawable trail had every point at the end of
             // its life, so it faded to nothing; there is no stale pixel to clear.
             wantsFrames = false
@@ -859,6 +966,15 @@ private final class MetalOverlayView: NSView {
             encoder.drawPrimitives(type: .triangle, vertexStart: particleStart, vertexCount: particleCount * 6)
         }
 
+        if rippleCount > 0 {
+            var uniforms = ParticleUniforms(viewport: viewport, now: now, color: color)
+            encoder.setRenderPipelineState(ripplePipeline)
+            encoder.setVertexBuffer(rippleBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<ParticleUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ParticleUniforms>.stride, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: rippleStart, vertexCount: rippleCount * 6)
+        }
+
         encoder.endEncoding()
         commandBuffer.present(drawable)
         commandBuffer.commit()
@@ -874,6 +990,7 @@ private final class MetalOverlayView: NSView {
             glowSoftness: softness,
             now: now,
             lifetime: mode.lifetime,
+            speedResponse: mode.speedResponse,
             hueSpread: mode.hueSpread,
             hueSpeed: mode.hueSpeed,
             coloring: mode.coloring.rawValue,
