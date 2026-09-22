@@ -20,6 +20,9 @@ struct TrailConfig {
     /// 0 = follow the display's native refresh rate. Set e.g. 60 on a 120 Hz
     /// ProMotion panel to halve the render work while the trail is alive.
     let maxFPS: Int = max(envInt("CURSORTRAIL_MAX_FPS", 0), 0)
+    /// Drop to half rate while the pointer is slow and while the trail fades
+    /// after it stops. Set to 0 to always render at the full rate above.
+    let adaptiveFPS: Bool = envInt("CURSORTRAIL_ADAPTIVE_FPS", 1) != 0
     let color: SIMD4<Float>
 
     init() {

@@ -5,7 +5,7 @@ A tiny, native macOS cursor-trail utility focused on low overhead, smooth render
 - Swift + AppKit + Metal
 - No Xcode project
 - No third-party dependencies
-- `CVDisplayLink` synced to the display instead of a fixed timer
+- `CADisplayLink` synced to the display instead of a fixed timer
 - Fixed-capacity ring buffer for trail samples
 - Shared Metal vertex buffer; no per-frame trail arrays
 - Native menu bar mode picker with persistent selection
@@ -108,26 +108,38 @@ Available options:
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `CURSORTRAIL_SAMPLE_DISTANCE` | `0.75` | Minimum movement before a new sample |
+| `CURSORTRAIL_SAMPLE_DISTANCE` | `0.75` | Minimum movement, in points, before a new sample |
+| `CURSORTRAIL_SAMPLE_INTERVAL` | `0.00833` | Minimum time, in seconds, between samples (120 Hz) |
 | `CURSORTRAIL_MAX_POINTS` | `256` | Fixed ring-buffer capacity |
 | `CURSORTRAIL_COLOR` | `0.35,0.72,1.0,0.95` | Linear-ish RGBA components, each 0...1 |
-| `CURSORTRAIL_MAX_FPS` | `0` | Cap the render rate; `0` follows the display. See below |
+| `CURSORTRAIL_MAX_FPS` | `0` | Cap the render rate; `0` follows the display |
+| `CURSORTRAIL_ADAPTIVE_FPS` | `1` | Halve the render rate while the pointer is slow or the trail is fading; `0` always renders at the full rate |
+
+Both frame-rate variables are described under [Render rate](#render-rate).
 
 ## Performance design
 
 ### Idle
 
-There is no fixed 90/120 Hz timer. Mouse events wake the relevant renderer. Once the final trail sample expires, its `CVDisplayLink` is stopped.
+There is no fixed 90/120 Hz timer. Mouse events wake the relevant renderer. Once the final trail sample expires, its `CADisplayLink` is stopped.
 
 The idle process still has AppKit windows and global mouse monitoring, but it does no continuous Metal rendering.
 
 ### Active
 
-Each active display uses a fixed-size trail ring buffer and one preallocated shared Metal vertex buffer. Metal renders the pass list declared by the active mode. **Comet** uses three tiny triangle-strip passes (outer glow, middle glow, bright core), while **Line** uses a single thin pass. All passes reuse the same vertex buffer. There are no per-segment CoreGraphics stroke calls.
+Each active display uses a fixed-size trail ring buffer and one preallocated shared Metal vertex buffer. A mouse sample only updates the newest one or two vertex pairs; fade age is computed in the shader, so no frame rebuilds the trail. Metal renders the pass list declared by the active mode - **Comet** uses three tiny triangle-strip passes (outer glow, middle glow, bright core), **Line** uses a single thin pass - and all passes reuse the same vertex buffer. There are no per-segment CoreGraphics stroke calls.
+
+Mouse events do no geometry work of their own. The monitors only gate the sample and stash it; the ring update and vertex writes are coalesced into the next display-link frame, on the render thread. Samples keep their own timestamps, so coalescing costs no fidelity.
+
+### Render rate
+
+Putting a frame on screen costs about a millisecond of CPU inside CoreAnimation and Metal regardless of how little it draws, so the cheapest frame is the one that is never presented. The display link runs at the display's full rate only while the pointer is moving fast enough for consecutive frames to land visibly apart; below 400 pt/s, and through the fade after the pointer stops, it drops to half rate (floored at 30). Crossing back above 700 pt/s promotes it from the sampling path rather than the next frame, so the start of a flick is never the frame that goes missing.
+
+Sampling is untouched by this - points still arrive at up to 120 Hz and still land in the ring - so the shape of the trail is identical either way. Only how often that shape is presented changes. `CURSORTRAIL_ADAPTIVE_FPS=0` pins the full rate; `CURSORTRAIL_MAX_FPS` caps it.
 
 ### Multi-display
 
-Each display owns its own transparent overlay and display link. Moving onto another display starts its renderer while the old display is allowed to finish fading. Displays with no trail remain stopped.
+Each display owns its own transparent overlay and display link. The overlay covers its whole display and never moves or resizes - a smaller box that chases the cursor cannot be kept in step with the frames already in the present queue, and each stale frame paints a visible ghost. Moving onto another display starts its renderer while the old display is allowed to finish fading. Displays with no trail remain stopped.
 
 ## Measuring it on your Mac
 
@@ -156,44 +168,10 @@ The global `NSEvent` monitor is used to receive mouse movement outside the proce
 ```text
 main.swift           app lifecycle + menu bar + global mouse monitoring
 TrailModes.swift     extensible mode registry and GPU pass presets
-TrailRenderer.swift  overlays, ring buffer, CVDisplayLink, Metal renderer
+TrailRenderer.swift  overlays, ring buffer, CADisplayLink, Metal renderer
 Trail.metal          editable Metal shader source
 build.sh             embeds Trail.metal, then builds one native executable with swiftc
 run.sh               foreground run
 install.sh           LaunchAgent install
 uninstall.sh         uninstall
 ```
-
-## Performance notes (v3)
-
-The renderer keeps trail geometry in a mirrored fixed-size GPU ring buffer. Mouse samples only update the newest one or two vertex pairs; fade age is calculated in the Metal shader. This avoids rebuilding every trail vertex on every display frame. Sampling is also capped to 120 Hz by default (`CURSORTRAIL_SAMPLE_INTERVAL`, seconds) while preserving display-synced fading.
-
-## Performance v5
-
-The Metal overlay is no longer permanently full-screen. CursorTrail keeps a small, padded drawable around the active trail and expands/repositions it only when needed. This preserves the original 3-pass Comet appearance while reducing transparent Retina surface compositing work.
-
-## Performance v6
-
-v5 sized the overlay to fit the trail exactly, which meant `drawableSize` changed 10-20 times a second while the cursor moved. Every change discards the `CAMetalLayer` drawable pool, so the next frame has to allocate fresh `IOSurface`s and re-register them with the render server. Profiling showed that churn, not the drawing, was the dominant cost: `-[CAMetalLayer nextDrawable]` accounted for roughly three quarters of the render-loop time.
-
-v6 keeps the overlay on a short ladder of fixed sizes instead:
-
-- The window is **moved** freely (cheap) but only ever **resized** to one of five sizes derived from the display, with hysteresis before it steps back down. Ordinary cursor motion stays on the smallest rung and never resizes at all; a fast flick promotes one rung, once. Measured over a fast 10 s sweep: 1 resize total, down from 11-18 per second.
-- Mouse events no longer do geometry work. The event monitors only gate the sample and stash it; the ring buffer update, vertex writes, bounds and window placement are coalesced into the next display-link frame. Sample fidelity is unchanged - pending samples keep their own timestamps.
-- Smaller wins: the vertex buffer pointer and the render pass descriptor are created once rather than per write/frame, the sample distance gate compares squared lengths, and trail bounds are computed over at most two contiguous runs with SIMD min/max instead of a modulo per point.
-
-Measured on an M1 (60 Hz display, `ps` CPU-time deltas), CPU while the cursor is moving:
-
-| | v5 | v6 |
-|---|---:|---:|
-| typical motion (~250 px/s) | 9% | 9% |
-| fast sweep (~2000 px/s) | 14% | 9% |
-| idle | 0% | 0% |
-
-The remaining cost is close to the floor for this kind of app. About 4 points of it is the process receiving and decoding mouse-moved events at the display rate - a bare accessory app with one visible window and no drawing at all measures the same 4% - and the rest is the fixed per-frame cost of submitting and presenting one Metal frame 60 times a second. Neither shrinks by drawing less: pass count, render scale and drawable count all measured identically.
-
-If you want to go below that, the only real lever is rendering fewer frames. `CURSORTRAIL_MAX_FPS=30` measures 7%, at the cost of a visibly choppier trail.
-
-Trade-off worth knowing: the drawable is now sized by rung rather than fitted exactly, so a sustained fast flick holds a larger surface than v5 did - physical footprint peaks around 42 MB instead of 24 MB while that lasts, then falls back (about 20 MB during ordinary motion, 11 MB idle) once the trail shrinks and the shrink hysteresis elapses. A denser ladder was measured and rejected: it saved 4 MB at the peak but tripled the resize count and cost a point of CPU.
-
-Trail coverage was checked rather than assumed. Over 10 s runs at both speeds, neither v5 nor v6 clipped the trail itself in any frame, and v6 clips the outer glow margin in 5 frames out of 621 where v5 clipped it in 544 out of 598 - the fixed rungs are centred and generous, where v5's exact fit let the padding fall off the edge of the drawable.
