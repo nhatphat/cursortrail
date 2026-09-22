@@ -120,7 +120,7 @@ final class OverlayController {
         window.level = .screenSaver
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
 
-        guard let view = MetalOverlayView(frame: NSRect(origin: .zero, size: frame.size), device: device, screen: screen, config: config, mode: mode) else {
+        guard let view = MetalOverlayView(frame: NSRect(origin: .zero, size: frame.size), device: device, screen: screen, config: config, mode: mode, nativeFPS: screen.maximumFramesPerSecond) else {
             return nil
         }
         window.contentView = view
@@ -182,6 +182,29 @@ private final class MetalOverlayView: NSView {
     private var renderThread: Thread?
     private var wantsFrames = false
 
+    // Presenting a drawable costs about a millisecond of CPU spread across
+    // CoreAnimation's and Metal's own queues, and that price is the same
+    // whether the frame draws three triangle strips or nothing at all -- a
+    // bare clear-and-present loop on this machine measures the same. Drawing
+    // less does not help; presenting less often is the only lever there is.
+    //
+    // Full refresh rate is only worth paying for while the pointer is fast
+    // enough that consecutive frames land visibly apart. Below that, and
+    // through the fade after the pointer stops, half rate is indistinguishable.
+    // Sampling is untouched by this -- points still arrive at up to 120 Hz and
+    // still land in the ring -- so the trail's *shape* is identical either way;
+    // only how often that shape is put on screen changes.
+    private enum FrameTier { case full, reduced }
+    private var tier = FrameTier.full
+    private let fullFPS: Float
+    private let reducedFPS: Float
+    /// Exponential average of pointer speed in points per second. Promote and
+    /// demote at different speeds so a pointer hovering around the threshold
+    /// does not flip the display link back and forth every frame.
+    private var pointerSpeed: Float = 0
+    private static let promoteSpeed: Float = 700
+    private static let demoteSpeed: Float = 400
+
     // Samples captured by the event monitors, consumed by the display link.
     private var pending: [TrailPoint]
     private var pendingCount = 0
@@ -190,7 +213,11 @@ private final class MetalOverlayView: NSView {
     private let minSampleDistanceSquared: Float
     private let minSampleInterval: Double
 
-    init?(frame: NSRect, device: MTLDevice, screen: NSScreen, config: TrailConfig, mode: TrailMode) {
+    init?(frame: NSRect, device: MTLDevice, screen: NSScreen, config: TrailConfig, mode: TrailMode, nativeFPS: Int) {
+        let full = Float(config.maxFPS > 0 ? config.maxFPS : max(nativeFPS, 1))
+        self.fullFPS = full
+        // Half rate, floored at 30: below that the fade itself starts to step.
+        self.reducedFPS = config.adaptiveFPS ? min(full, max(30, full * 0.5)) : full
         self.device = device
         self.config = config
         self.screen = screen
@@ -268,6 +295,9 @@ private final class MetalOverlayView: NSView {
         stateLock.lock()
         points.removeAll()
         pendingCount = 0
+        pointerSpeed = 0
+        tier = .full
+        applyTierUnlocked()
         lastPoint = p
         lastSampleTime = now
         let physical = points.append(TrailPoint(p: p, t: now))
@@ -288,6 +318,18 @@ private final class MetalOverlayView: NSView {
                 || now - lastSampleTime < minSampleInterval {
                 stateLock.unlock()
                 return
+            }
+        }
+
+        if let lastPoint, now > lastSampleTime {
+            let instant = simd_length(p - lastPoint) / Float(now - lastSampleTime)
+            pointerSpeed += (instant - pointerSpeed) * 0.35
+            // Promote from the sampling path, not from the next frame: at half
+            // rate that frame can be 33 ms away, and the start of a flick is
+            // exactly where the missing frames would show.
+            if tier == .reduced && pointerSpeed >= MetalOverlayView.promoteSpeed {
+                tier = .full
+                applyTierUnlocked()
             }
         }
 
@@ -328,16 +370,30 @@ private final class MetalOverlayView: NSView {
 
     @objc private func wakeRenderThread() {}
 
+    /// Caller must hold `stateLock`. `preferredFrameRateRange` is the supported
+    /// way to ask for fewer callbacks; unlike skipping frames inside the
+    /// callback it lets the system stop waking the render thread at all.
+    private func applyTierUnlocked() {
+        guard let displayLink else { return }
+        guard tier == .reduced || config.maxFPS > 0 else {
+            // Uncapped full rate: ask for nothing and let the link run on the
+            // display's own cadence rather than pinning it to a number.
+            displayLink.preferredFrameRateRange = .default
+            return
+        }
+        let fps = tier == .full ? fullFPS : reducedFPS
+        displayLink.preferredFrameRateRange = CAFrameRateRange(
+            minimum: max(1, fps * 0.5), maximum: fps, preferred: fps
+        )
+    }
+
     private func startRenderThread() {
         let link = screen.displayLink(target: self, selector: #selector(displayLinkFired(_:)))
-        if config.maxFPS > 0 {
-            let fps = Float(config.maxFPS)
-            link.preferredFrameRateRange = CAFrameRateRange(
-                minimum: max(1, fps * 0.5), maximum: fps, preferred: fps
-            )
-        }
         link.isPaused = true
         displayLink = link
+        stateLock.lock()
+        applyTierUnlocked()
+        stateLock.unlock()
 
         let thread = Thread { [weak self] in
             guard let self else { return }
@@ -375,6 +431,8 @@ private final class MetalOverlayView: NSView {
     private func requestFramesUnlocked() {
         guard !wantsFrames else { return }
         wantsFrames = true
+        tier = .full
+        applyTierUnlocked()
         displayLink?.isPaused = false
     }
 
@@ -421,6 +479,14 @@ private final class MetalOverlayView: NSView {
         let headChanged = points.removeExpired(before: nowAbsolute - Double(mode.lifetime))
         let appended = drainPendingUnlocked()
         let count = points.count
+
+        // A frame with no new sample means the pointer has stopped or is
+        // crawling; let the average fall so the fade-out settles at half rate.
+        if appended == 0 { pointerSpeed *= 0.7 }
+        if tier == .full && pointerSpeed < MetalOverlayView.demoteSpeed {
+            tier = .reduced
+            applyTierUnlocked()
+        }
 
         if count < 2 {
             // The last frame with a drawable trail had every point at the end of
