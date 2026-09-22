@@ -8,8 +8,8 @@ A tiny, native macOS cursor-trail utility focused on low overhead, smooth render
 - `CADisplayLink` synced to the display instead of a fixed timer
 - Fixed-capacity ring buffer for trail samples
 - Shared Metal vertex buffer; no per-frame trail arrays
-- Native menu bar mode picker with persistent selection
-- Built-in **Comet** (Ghostty-like) and **Line** modes
+- Native menu bar mode and colour pickers, both persistent
+- Five built-in modes: **Comet**, **Line**, **Rainbow Road**, **Gradient**, **Blur**
 - Mode registry designed so new modes can be added without changing the input/render core
 - Transparent click-through overlay per display
 - Only a display that currently has a fading trail renders
@@ -88,12 +88,31 @@ Choose the active mode from the menu bar icon. The selection is stored in `UserD
 
 Built-in modes:
 
-- **Comet** — the original Ghostty-like glowing trail, rendered as three GPU passes.
-- **Line** — a thin, understated line that follows the pointer path and fades away, rendered as one GPU pass.
+| Mode | Look | Passes | Colour |
+|---|---|---:|---|
+| **Comet** | the original Ghostty-like glowing trail | 3 | your colour |
+| **Line** | a thin, understated line along the pointer path | 1 | your colour |
+| **Rainbow Road** | hues sweep down the trail and scroll over time | 3 | its own |
+| **Gradient** | your colour at the head, fading into a hue-rotated tail | 2 | your colour |
+| **Blur** | a wide, diffuse smudge with no hard edge | 5 | your colour |
+
+**Blur** has no separate blur pass. Stacking wide, fully soft, nearly transparent strips over each other sums to the same falloff, and each extra pass is one more `drawPrimitives` on a vertex buffer that is already bound — no second render target, no read-back.
+
+**Rainbow Road** picks its hue from how far down the trail a fragment sits, so the pattern is anchored to the pointer and scrolls with time rather than with position on screen. **Gradient** derives its tail colour by rotating your chosen colour's hue; pick a near-grey and it lifts the saturation so the tail is still a visibly different colour.
 
 ### Adding another mode
 
-Modes are declared in `TrailModes.swift`. Add one `TrailMode` entry to `TrailModeRegistry.all`; the menu bar is generated automatically. A mode controls its lifetime, width, and one-or-more GPU passes. The mouse monitoring, ring buffer, display-link lifecycle, and overlay code do not need to change.
+Modes are declared in `TrailModes.swift`. Add one `TrailMode` entry to `TrailModeRegistry.all`; the menu bar is generated automatically. A mode controls its lifetime, width, its colouring (`.solid`, `.gradient`, `.rainbow`), and one-or-more GPU passes. The mouse monitoring, ring buffer, display-link lifecycle, and overlay code do not need to change.
+
+A genuinely new *kind* of colouring needs one more branch in `trailFragment` and one more case in `TrailColoring`. That enum's raw values are the wire format of the `coloring` uniform, so they cannot be renumbered on their own.
+
+## Trail colour
+
+The menu bar icon has a **Trail Color** submenu: eight preset swatches, plus **Custom...** which opens the standard macOS colour panel with the alpha slider enabled. The trail recolours live while a swatch is dragged in that panel.
+
+The chosen colour is stored in `UserDefaults` and restored on the next launch. `CURSORTRAIL_COLOR` is the *initial* value only — once a colour has been picked from the menu, that choice wins.
+
+While **Rainbow Road** is active the submenu says so, because that mode generates its own hues and takes only the opacity from your colour.
 
 ## Tuning
 
@@ -111,7 +130,7 @@ Available options:
 | `CURSORTRAIL_SAMPLE_DISTANCE` | `0.75` | Minimum movement, in points, before a new sample |
 | `CURSORTRAIL_SAMPLE_INTERVAL` | `0.00833` | Minimum time, in seconds, between samples (120 Hz) |
 | `CURSORTRAIL_MAX_POINTS` | `256` | Fixed ring-buffer capacity |
-| `CURSORTRAIL_COLOR` | `0.35,0.72,1.0,0.95` | Linear-ish RGBA components, each 0...1 |
+| `CURSORTRAIL_COLOR` | `0.35,0.72,1.0,0.95` | Initial RGBA components, each 0...1; the menu bar picker overrides it once used |
 | `CURSORTRAIL_MAX_FPS` | `0` | Cap the render rate; `0` follows the display |
 | `CURSORTRAIL_ADAPTIVE_FPS` | `1` | Halve the render rate while the pointer is slow or the trail is fading; `0` always renders at the full rate |
 
@@ -127,7 +146,7 @@ The idle process still has AppKit windows and global mouse monitoring, but it do
 
 ### Active
 
-Each active display uses a fixed-size trail ring buffer and one preallocated shared Metal vertex buffer. A mouse sample only updates the newest one or two vertex pairs; fade age is computed in the shader, so no frame rebuilds the trail. Metal renders the pass list declared by the active mode - **Comet** uses three tiny triangle-strip passes (outer glow, middle glow, bright core), **Line** uses a single thin pass - and all passes reuse the same vertex buffer. There are no per-segment CoreGraphics stroke calls.
+Each active display uses a fixed-size trail ring buffer and one preallocated shared Metal vertex buffer. A mouse sample only updates the newest one or two vertex pairs; fade age is computed in the shader, so no frame rebuilds the trail. Metal renders the pass list declared by the active mode - **Comet** uses three tiny triangle-strip passes (outer glow, middle glow, bright core), **Line** uses a single thin pass, **Blur** uses five - and every pass of every mode reuses the same vertex buffer. Colouring is a uniform and a branch in the fragment shader, so **Rainbow Road** and **Gradient** cost no extra geometry, no extra draw call, and no per-frame CPU work; the gradient's tail colour is derived once, when the colour or the mode changes. There are no per-segment CoreGraphics stroke calls.
 
 Mouse events do no geometry work of their own. The monitors only gate the sample and stash it; the ring update and vertex writes are coalesced into the next display-link frame, on the render thread. Samples keep their own timestamps, so coalescing costs no fidelity.
 

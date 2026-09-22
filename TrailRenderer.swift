@@ -16,6 +16,9 @@ private struct TrailVertex {
     var birthTime: Float
 }
 
+/// Mirrors `Uniforms` in Trail.metal field for field, including `pad`. Both
+/// layouts put the two SIMD4s last so they land on their natural 16-byte
+/// alignment without either language inserting padding of its own.
 private struct Uniforms {
     var viewport: SIMD2<Float>
     var headWidth: Float
@@ -24,7 +27,12 @@ private struct Uniforms {
     var glowSoftness: Float
     var now: Float
     var lifetime: Float
+    var hueSpread: Float
+    var hueSpeed: Float
+    var coloring: UInt32
+    var pad: Float = 0
     var color: SIMD4<Float>
+    var tailColor: SIMD4<Float>
 }
 
 private final class RingBuffer {
@@ -84,7 +92,7 @@ final class OverlayController {
     private let window: NSWindow
     private let view: MetalOverlayView
 
-    init?(screen: NSScreen, config: TrailConfig, mode: TrailMode) {
+    init?(screen: NSScreen, config: TrailConfig, mode: TrailMode, color: SIMD4<Float>) {
         guard let device = MTLCreateSystemDefaultDevice() else { return nil }
         self.screen = screen
         self.config = config
@@ -120,7 +128,7 @@ final class OverlayController {
         window.level = .screenSaver
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
 
-        guard let view = MetalOverlayView(frame: NSRect(origin: .zero, size: frame.size), device: device, screen: screen, config: config, mode: mode, nativeFPS: screen.maximumFramesPerSecond) else {
+        guard let view = MetalOverlayView(frame: NSRect(origin: .zero, size: frame.size), device: device, screen: screen, config: config, mode: mode, color: color, nativeFPS: screen.maximumFramesPerSecond) else {
             return nil
         }
         window.contentView = view
@@ -138,6 +146,8 @@ final class OverlayController {
         self.mode = mode
         view.setMode(mode)
     }
+
+    func setColor(_ color: SIMD4<Float>) { view.setColor(color) }
 
     func shutdown() {
         view.shutdown()
@@ -162,6 +172,11 @@ private final class MetalOverlayView: NSView {
     private let config: TrailConfig
     private let screen: NSScreen
     private var mode: TrailMode
+    /// The colour chosen in the menu bar, plus the tail colour the gradient
+    /// mode derives from it. Both are recomputed whenever either the colour or
+    /// the mode changes, so the render thread never does hue maths per frame.
+    private var trailColor: SIMD4<Float>
+    private var tailColor: SIMD4<Float>
     private let points: RingBuffer
     private let vertexBuffer: MTLBuffer
     private let vertexPointer: UnsafeMutablePointer<TrailVertex>
@@ -213,7 +228,7 @@ private final class MetalOverlayView: NSView {
     private let minSampleDistanceSquared: Float
     private let minSampleInterval: Double
 
-    init?(frame: NSRect, device: MTLDevice, screen: NSScreen, config: TrailConfig, mode: TrailMode, nativeFPS: Int) {
+    init?(frame: NSRect, device: MTLDevice, screen: NSScreen, config: TrailConfig, mode: TrailMode, color: SIMD4<Float>, nativeFPS: Int) {
         let full = Float(config.maxFPS > 0 ? config.maxFPS : max(nativeFPS, 1))
         self.fullFPS = full
         // Half rate, floored at 30: below that the fade itself starts to step.
@@ -222,6 +237,8 @@ private final class MetalOverlayView: NSView {
         self.config = config
         self.screen = screen
         self.mode = mode
+        self.trailColor = color
+        self.tailColor = TrailColorMath.rotatingHue(of: color, by: mode.tailHueShift)
         self.points = RingBuffer(capacity: config.maxPoints)
         self.pending = Array(repeating: TrailPoint(p: .zero, t: 0), count: MetalOverlayView.maxPendingSamples)
         self.minSampleDistanceSquared = config.minSampleDistance * config.minSampleDistance
@@ -349,6 +366,14 @@ private final class MetalOverlayView: NSView {
     func setMode(_ mode: TrailMode) {
         stateLock.lock()
         self.mode = mode
+        self.tailColor = TrailColorMath.rotatingHue(of: trailColor, by: mode.tailHueShift)
+        stateLock.unlock()
+    }
+
+    func setColor(_ color: SIMD4<Float>) {
+        stateLock.lock()
+        self.trailColor = color
+        self.tailColor = TrailColorMath.rotatingHue(of: color, by: mode.tailHueShift)
         stateLock.unlock()
     }
 
@@ -476,6 +501,8 @@ private final class MetalOverlayView: NSView {
 
         stateLock.lock()
         let mode = self.mode
+        let color = self.trailColor
+        let tail = self.tailColor
         let headChanged = points.removeExpired(before: nowAbsolute - Double(mode.lifetime))
         let appended = drainPendingUnlocked()
         let count = points.count
@@ -534,8 +561,9 @@ private final class MetalOverlayView: NSView {
                 vertexCount: count * 2,
                 viewport: viewport,
                 now: now,
-                lifetime: mode.lifetime,
-                headWidth: mode.headWidth,
+                mode: mode,
+                color: color,
+                tailColor: tail,
                 widthScale: passStyle.widthScale,
                 alpha: passStyle.alpha,
                 softness: passStyle.softness
@@ -548,16 +576,20 @@ private final class MetalOverlayView: NSView {
         attachment.texture = nil
     }
 
-    private func drawPass(encoder: MTLRenderCommandEncoder, vertexStart: Int, vertexCount: Int, viewport: SIMD2<Float>, now: Float, lifetime: Float, headWidth: Float, widthScale: Float, alpha: Float, softness: Float) {
+    private func drawPass(encoder: MTLRenderCommandEncoder, vertexStart: Int, vertexCount: Int, viewport: SIMD2<Float>, now: Float, mode: TrailMode, color: SIMD4<Float>, tailColor: SIMD4<Float>, widthScale: Float, alpha: Float, softness: Float) {
         var uniforms = Uniforms(
             viewport: viewport,
-            headWidth: headWidth * contentScale,
+            headWidth: mode.headWidth * contentScale,
             widthScale: widthScale,
             alphaScale: alpha,
             glowSoftness: softness,
             now: now,
-            lifetime: lifetime,
-            color: config.color
+            lifetime: mode.lifetime,
+            hueSpread: mode.hueSpread,
+            hueSpeed: mode.hueSpeed,
+            coloring: mode.coloring.rawValue,
+            color: color,
+            tailColor: tailColor
         )
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 1)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 0)
