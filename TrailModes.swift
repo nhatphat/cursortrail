@@ -9,21 +9,25 @@ enum TrailColoring: UInt32 {
     case rainbow = 2
 }
 
-/// What makes a mode emit particles. Movement emits along the pointer's path;
-/// tripleClick waits for a burst.
+/// What makes an emitter fire. Movement emits along the pointer's path; click
+/// waits for a gesture of `burstClicks` clicks.
 enum ParticleTrigger {
     case movement
-    case tripleClick
+    case click
 }
 
+/// One emitter. A mode may carry several, which is how a single mode throws
+/// confetti as the pointer moves *and* sets off a firework when it is clicked.
 struct ParticleStyle {
     let trigger: ParticleTrigger
     /// Movement only: points of pointer travel between one particle and the
     /// next. Distance rather than time, so a slow drag does not carpet the
     /// screen and a flick does not leave gaps.
     let spacing: Float
-    /// tripleClick only: how many particles one burst emits.
+    /// Click only: how many particles one burst emits, and how many clicks
+    /// within the system double-click interval set it off.
     let burstCount: Int
+    let burstClicks: Int
     let speed: ClosedRange<Float>
     /// Half-angle of the emission cone, in radians, measured off straight up.
     /// `.pi` is the whole circle.
@@ -61,7 +65,7 @@ struct TrailMode {
     let hueSpread: Float
     let hueSpeed: Float
     let passes: [TrailPassStyle]
-    let particles: ParticleStyle?
+    let emitters: [ParticleStyle]
 
     init(
         id: String,
@@ -73,7 +77,7 @@ struct TrailMode {
         hueSpread: Float = 0,
         hueSpeed: Float = 0,
         passes: [TrailPassStyle],
-        particles: ParticleStyle? = nil
+        emitters: [ParticleStyle] = []
     ) {
         self.id = id
         self.title = title
@@ -84,14 +88,22 @@ struct TrailMode {
         self.hueSpread = hueSpread
         self.hueSpeed = hueSpeed
         self.passes = passes
-        self.particles = particles
+        self.emitters = emitters
+    }
+
+    /// The ring reclaims a particle's slot by birth order, which is only in
+    /// death order when every emitter agrees on a lifetime. Expiring against
+    /// the longest one keeps that true; a particle past its own lifetime has
+    /// already faded to nothing, so the extra slots cost pixels, not looks.
+    var maxParticleLifetime: Float {
+        emitters.map(\.lifetime).max() ?? 0
     }
 
     /// False when the mode generates its own hues, and the chosen colour only
     /// contributes its opacity. The menu bar says so rather than looking broken.
     var usesTrailColor: Bool {
         if coloring == .rainbow { return false }
-        if let particles, particles.randomHue, passes.isEmpty { return false }
+        if passes.isEmpty, emitters.allSatisfy(\.randomHue) { return false }
         return true
     }
 }
@@ -176,10 +188,11 @@ enum TrailModeRegistry {
                 TrailPassStyle(widthScale: 1.8, alpha: 0.14, softness: 0.95),
                 TrailPassStyle(widthScale: 1.0, alpha: 0.55, softness: 0.55),
             ],
-            particles: ParticleStyle(
+            emitters: [ParticleStyle(
                 trigger: .movement,
                 spacing: 14.0,
                 burstCount: 0,
+                burstClicks: 0,
                 speed: 70...200,
                 // Biased upward rather than radial, so the paper is thrown off
                 // the pointer and then falls, instead of spraying evenly.
@@ -195,7 +208,7 @@ enum TrailModeRegistry {
                 roundness: 0.15,
                 flutter: true,
                 randomHue: true
-            )
+            )]
         ),
         TrailMode(
             id: "firework",
@@ -206,10 +219,11 @@ enum TrailModeRegistry {
                 TrailPassStyle(widthScale: 2.2, alpha: 0.16, softness: 1.00),
                 TrailPassStyle(widthScale: 1.0, alpha: 0.70, softness: 0.50),
             ],
-            particles: ParticleStyle(
-                trigger: .tripleClick,
+            emitters: [ParticleStyle(
+                trigger: .click,
                 spacing: 0,
                 burstCount: 72,
+                burstClicks: 1,
                 speed: 200...460,
                 spread: .pi,
                 // Enough droop to arc the burst without collapsing it before
@@ -221,7 +235,58 @@ enum TrailModeRegistry {
                 roundness: 1.0,
                 flutter: false,
                 randomHue: true
-            )
+            )]
+        ),
+        TrailMode(
+            id: "party",
+            title: "Party",
+            lifetime: 0.36,
+            headWidth: 11.0,
+            passes: [
+                TrailPassStyle(widthScale: 1.9, alpha: 0.15, softness: 0.95),
+                TrailPassStyle(widthScale: 1.0, alpha: 0.60, softness: 0.55),
+            ],
+            // Both at once: paper off the pointer as it moves, sparks wherever
+            // it is clicked. The two emitters differ in lifetime, gravity and
+            // shape, which is why a particle carries its own physics rather
+            // than reading them from a uniform.
+            emitters: [ParticleStyle(
+                trigger: .movement,
+                spacing: 14.0,
+                burstCount: 0,
+                burstClicks: 0,
+                speed: 70...200,
+                // Biased upward rather than radial, so the paper is thrown off
+                // the pointer and then falls, instead of spraying evenly.
+                spread: 1.15,
+                // Well under real gravity. At anything like 900 the paper drops
+                // roughly 600 points inside its lifetime -- more than half a
+                // display -- and reads as being sucked downward rather than
+                // fluttering. This falls about 200.
+                gravity: -260,
+                lifetime: 1.25,
+                size: 4.5,
+                spin: 6...16,
+                roundness: 0.15,
+                flutter: true,
+                randomHue: true
+            ), ParticleStyle(
+                trigger: .click,
+                spacing: 0,
+                burstCount: 72,
+                burstClicks: 1,
+                speed: 200...460,
+                spread: .pi,
+                // Enough droop to arc the burst without collapsing it before
+                // the sparks have finished spreading.
+                gravity: -520,
+                lifetime: 1.00,
+                size: 3.0,
+                spin: 0...0,
+                roundness: 1.0,
+                flutter: false,
+                randomHue: true
+            )]
         ),
     ]
 

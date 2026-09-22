@@ -44,16 +44,16 @@ private struct ParticleVertex {
     var size: Float
     var spin: Float
     var corner: SIMD2<Float>
+    var gravity: Float
+    var lifetime: Float
+    var roundness: Float
+    var flutter: Float
 }
 
 /// Mirrors `ParticleUniforms` in Trail.metal.
 private struct ParticleUniforms {
     var viewport: SIMD2<Float>
     var now: Float
-    var lifetime: Float
-    var gravity: Float
-    var roundness: Float
-    var flutter: Float
     var pad: Float = 0
     var color: SIMD4<Float>
 }
@@ -242,7 +242,9 @@ final class OverlayController {
 
     func setColor(_ color: SIMD4<Float>) { view.setColor(color) }
 
-    func burst(globalPoint: CGPoint) { view.burst(at: localPoint(globalPoint)) }
+    func burst(globalPoint: CGPoint, clickCount: Int, wantedClicks: Int) {
+        view.burst(at: localPoint(globalPoint), clickCount: clickCount, wantedClicks: wantedClicks)
+    }
 
     func shutdown() {
         view.shutdown()
@@ -336,6 +338,8 @@ private final class MetalOverlayView: NSView {
         var p: SIMD2<Float>
         var count: Int
         var burst: Bool
+        /// Which of the mode's emitters threw these.
+        var emitter: Int
     }
     private static let maxPendingSpawns = 16
 
@@ -497,13 +501,14 @@ private final class MetalOverlayView: NSView {
             }
         }
 
-        if let style = mode.particles, style.trigger == .movement, let previous = lastPoint {
+        if let style = mode.emitters.first(where: { $0.trigger == .movement }), let previous = lastPoint {
             emissionCarry += simd_length(p - previous)
             let spacing = max(style.spacing, 0.5)
             if emissionCarry >= spacing {
                 let due = Int(emissionCarry / spacing)
                 emissionCarry -= Float(due) * spacing
-                queueSpawnUnlocked(SpawnRequest(p: p, count: due, burst: false))
+                let index = mode.emitters.firstIndex(where: { $0.trigger == .movement }) ?? 0
+                queueSpawnUnlocked(SpawnRequest(p: p, count: due, burst: false, emitter: index))
             }
         }
 
@@ -520,15 +525,17 @@ private final class MetalOverlayView: NSView {
         stateLock.unlock()
     }
 
-    /// A triple click landed on this display. Ignored unless the active mode
-    /// actually wants bursts, so the monitor can stay installed for every mode.
-    func burst(at p: SIMD2<Float>) {
+    /// A click landed on this display. Ignored unless the active mode has an
+    /// emitter waiting for exactly this many clicks, so the monitor can stay
+    /// installed for every mode.
+    func burst(at p: SIMD2<Float>, clickCount: Int, wantedClicks: Int) {
         stateLock.lock()
-        guard let style = mode.particles, style.trigger == .tripleClick else {
+        guard clickCount == wantedClicks,
+              let index = mode.emitters.firstIndex(where: { $0.trigger == .click }) else {
             stateLock.unlock()
             return
         }
-        queueSpawnUnlocked(SpawnRequest(p: p, count: style.burstCount, burst: true))
+        queueSpawnUnlocked(SpawnRequest(p: p, count: mode.emitters[index].burstCount, burst: true, emitter: index))
         requestFramesUnlocked()
         stateLock.unlock()
     }
@@ -671,11 +678,13 @@ private final class MetalOverlayView: NSView {
     /// Caller must hold `stateLock`; runs on the render thread. Turns each
     /// queued request into particles and writes their vertices once -- after
     /// this the GPU derives everything else from the vertex's age.
-    private func drainSpawnsUnlocked(style: ParticleStyle, nowAbsolute: Double) {
+    private func drainSpawnsUnlocked(emitters: [ParticleStyle], nowAbsolute: Double) {
         guard !pendingSpawns.isEmpty else { return }
         let birth = Float(nowAbsolute - timeOrigin)
 
         for request in pendingSpawns {
+            guard request.emitter < emitters.count else { continue }
+            let style = emitters[request.emitter]
             for _ in 0..<request.count {
                 // A burst goes out in every direction; movement throws the
                 // paper up and off the pointer within a cone.
@@ -703,7 +712,11 @@ private final class MetalOverlayView: NSView {
                     // texture rather than as separate pieces of paper.
                     size: style.size * contentScale * (0.7 + 0.6 * random.next01()),
                     spin: spin,
-                    corner: .zero
+                    corner: .zero,
+                    gravity: style.gravity * contentScale,
+                    lifetime: style.lifetime,
+                    roundness: style.roundness,
+                    flutter: style.flutter ? 1 : 0
                 )
 
                 let base = physical * 6
@@ -753,9 +766,9 @@ private final class MetalOverlayView: NSView {
         let appended = drainPendingUnlocked()
         let count = points.count
 
-        if let style = mode.particles {
-            particles.removeExpired(before: nowAbsolute - Double(style.lifetime))
-            drainSpawnsUnlocked(style: style, nowAbsolute: nowAbsolute)
+        if !mode.emitters.isEmpty {
+            particles.removeExpired(before: nowAbsolute - Double(mode.maxParticleLifetime))
+            drainSpawnsUnlocked(emitters: mode.emitters, nowAbsolute: nowAbsolute)
         } else if particles.count > 0 {
             particles.removeAll()
         }
@@ -837,16 +850,8 @@ private final class MetalOverlayView: NSView {
             }
         }
 
-        if particleCount > 0, let style = mode.particles {
-            var uniforms = ParticleUniforms(
-                viewport: viewport,
-                now: now,
-                lifetime: style.lifetime,
-                gravity: style.gravity * contentScale,
-                roundness: style.roundness,
-                flutter: style.flutter ? 1 : 0,
-                color: color
-            )
+        if particleCount > 0 {
+            var uniforms = ParticleUniforms(viewport: viewport, now: now, color: color)
             encoder.setRenderPipelineState(particlePipeline)
             encoder.setVertexBuffer(particleBuffer, offset: 0, index: 0)
             encoder.setVertexBytes(&uniforms, length: MemoryLayout<ParticleUniforms>.stride, index: 1)

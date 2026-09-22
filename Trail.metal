@@ -106,6 +106,9 @@ fragment float4 trailFragment(RasterOut in [[stage_in]], constant Uniforms &u [[
 // thousand particles costs one draw call and no buffer traffic.
 // ---------------------------------------------------------------------------
 
+// Physics rides on the particle, not on the uniforms, so one mode can run
+// several emitters -- confetti and sparks, with different lifetimes, gravity
+// and shape -- and still have all of them drawn by a single call.
 struct ParticleVertex {
     float2 origin;
     float2 velocity;
@@ -116,19 +119,19 @@ struct ParticleVertex {
     float spin;
     /// Which corner of the quad this vertex is, in -1...1.
     float2 corner;
-};
-
-struct ParticleUniforms {
-    float2 viewport;
-    float now;
-    float lifetime;
     float gravity;
+    float lifetime;
     /// 0 draws a soft square, 1 a soft disc; confetti wants paper, sparks want
     /// points.
     float roundness;
     /// Non-zero squashes the quad across its spin, so a confetto reads as a
     /// flat piece of paper flipping over rather than a badge rotating.
     float flutter;
+};
+
+struct ParticleUniforms {
+    float2 viewport;
+    float now;
     float pad;
     float4 color;
 };
@@ -138,6 +141,7 @@ struct ParticleRasterOut {
     float2 corner;
     float age01;
     float hue;
+    float roundness;
 };
 
 vertex ParticleRasterOut particleVertex(
@@ -147,11 +151,11 @@ vertex ParticleRasterOut particleVertex(
 {
     ParticleVertex v = vertices[vid];
     float t = max(u.now - v.birthTime, 0.0);
-    float age01 = clamp(t / max(u.lifetime, 0.001), 0.0, 1.0);
+    float age01 = clamp(t / max(v.lifetime, 0.001), 0.0, 1.0);
 
     // Ballistic, with no drag term: drag has no closed form this cheap, and at
     // these speeds and lifetimes nobody can tell it is missing.
-    float2 centre = v.origin + v.velocity * t + float2(0.0, 0.5 * u.gravity * t * t);
+    float2 centre = v.origin + v.velocity * t + float2(0.0, 0.5 * v.gravity * t * t);
 
     float angle = v.spin * t;
     float ca = cos(angle);
@@ -159,7 +163,7 @@ vertex ParticleRasterOut particleVertex(
     float2 c = v.corner;
     // Squash across the spin axis first, then rotate, so the flutter reads as
     // the sheet turning edge-on rather than as the quad being scaled.
-    c.x *= mix(1.0, ca, u.flutter);
+    c.x *= mix(1.0, ca, v.flutter);
     float2 rotated = float2(c.x * ca - c.y * sa, c.x * sa + c.y * ca);
 
     float scale = v.size * (1.0 - 0.35 * age01);
@@ -174,6 +178,7 @@ vertex ParticleRasterOut particleVertex(
     out.corner = v.corner;
     out.age01 = age01;
     out.hue = v.hue;
+    out.roundness = v.roundness;
     return out;
 }
 
@@ -182,7 +187,7 @@ fragment float4 particleFragment(ParticleRasterOut in [[stage_in]], constant Par
     float2 q = abs(in.corner);
     float box = max(q.x, q.y);
     float disc = length(in.corner);
-    float d = mix(box, disc, clamp(u.roundness, 0.0, 1.0));
+    float d = mix(box, disc, clamp(in.roundness, 0.0, 1.0));
     float shape = 1.0 - smoothstep(0.72, 1.0, d);
 
     float life = 1.0 - in.age01;
