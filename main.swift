@@ -17,6 +17,11 @@ struct TrailConfig {
     let minSampleDistance: Float = envFloat("CURSORTRAIL_SAMPLE_DISTANCE", 0.75)
     let minSampleInterval: Double = Double(envFloat("CURSORTRAIL_SAMPLE_INTERVAL", 1.0 / 120.0))
     let maxPoints: Int = min(max(envInt("CURSORTRAIL_MAX_POINTS", 256), 32), 2048)
+    /// Live particles per display, for the modes that emit any. Reached only
+    /// during a burst; confetti settles far below it.
+    let maxParticles: Int = min(max(envInt("CURSORTRAIL_MAX_PARTICLES", 512), 32), 4096)
+    /// Clicks within the system double-click interval that set off a burst.
+    let burstClickCount: Int = min(max(envInt("CURSORTRAIL_BURST_CLICKS", 3), 2), 5)
     /// 0 = follow the display's native refresh rate. Set e.g. 60 on a 120 Hz
     /// ProMotion panel to halve the render work while the trail is alive.
     let maxFPS: Int = max(envInt("CURSORTRAIL_MAX_FPS", 0), 0)
@@ -67,6 +72,8 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     private var overlays: [OverlayController] = []
     private var globalMonitor: Any?
     private var localMonitor: Any?
+    private var globalClickMonitor: Any?
+    private var localClickMonitor: Any?
     private var activeOverlay: OverlayController?
     private var statusItem: NSStatusItem?
     private var modeMenuItems: [String: NSMenuItem] = [:]
@@ -102,6 +109,8 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
     }
 
     @objc private func screensChanged() {
@@ -289,7 +298,28 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
             return event
         }
 
+        // AppKit already counts multi-clicks against the user's double-click
+        // interval, so `clickCount` is the whole gesture detector. Both monitors
+        // only observe -- the click still reaches whatever was under it.
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            self?.handleClick(event)
+        }
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            self?.handleClick(event)
+            return event
+        }
+
         sampleMouse(force: true)
+    }
+
+    private func handleClick(_ event: NSEvent) {
+        guard event.clickCount == config.burstClickCount else { return }
+        let global = NSEvent.mouseLocation
+        if let active = activeOverlay, NSMouseInRect(global, active.screen.frame, false) {
+            active.burst(globalPoint: global)
+            return
+        }
+        overlays.first(where: { NSMouseInRect(global, $0.screen.frame, false) })?.burst(globalPoint: global)
     }
 
     private func sampleMouse(force: Bool = false) {

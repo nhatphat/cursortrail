@@ -35,6 +35,99 @@ private struct Uniforms {
     var tailColor: SIMD4<Float>
 }
 
+/// Mirrors `ParticleVertex` in Trail.metal.
+private struct ParticleVertex {
+    var origin: SIMD2<Float>
+    var velocity: SIMD2<Float>
+    var birthTime: Float
+    var hue: Float
+    var size: Float
+    var spin: Float
+    var corner: SIMD2<Float>
+}
+
+/// Mirrors `ParticleUniforms` in Trail.metal.
+private struct ParticleUniforms {
+    var viewport: SIMD2<Float>
+    var now: Float
+    var lifetime: Float
+    var gravity: Float
+    var roundness: Float
+    var flutter: Float
+    var pad: Float = 0
+    var color: SIMD4<Float>
+}
+
+/// A particle's path is fixed at spawn, so the only state worth keeping on the
+/// CPU is when it was born -- enough to know when its six vertices stop being
+/// worth drawing. Same shape as `RingBuffer`, and expiring is the same
+/// head-advance, because particles die in the order they were created.
+private final class ParticleRing {
+    private var birth: [Double]
+    private(set) var head = 0
+    private(set) var count = 0
+
+    init(capacity: Int) {
+        birth = Array(repeating: 0, count: max(capacity, 1))
+    }
+
+    var capacity: Int { birth.count }
+
+    @discardableResult
+    func append(birthTime: Double) -> Int {
+        let index: Int
+        if count < birth.count {
+            index = (head + count) % birth.count
+            count += 1
+        } else {
+            // Full: the oldest particle is overwritten mid-flight. At the
+            // capacities here that only happens under a burst far larger than
+            // any mode asks for, and dropping the faintest particle is the
+            // least visible way to lose one.
+            index = head
+            head = (head + 1) % birth.count
+        }
+        birth[index] = birthTime
+        return index
+    }
+
+    @discardableResult
+    func removeExpired(before cutoff: Double) -> Bool {
+        let oldHead = head
+        while count > 0 && birth[head] < cutoff {
+            head = (head + 1) % birth.count
+            count -= 1
+        }
+        return head != oldHead
+    }
+
+    func removeAll() {
+        head = 0
+        count = 0
+    }
+}
+
+/// xorshift64*, seeded per overlay. Particle spawning needs a few numbers per
+/// particle on the render thread; `Float.random` reaches for the system
+/// generator and a lock, which is more machinery than a confetto deserves.
+private struct FastRandom {
+    private var state: UInt64
+
+    init(seed: UInt64) { state = seed | 1 }
+
+    mutating func next01() -> Float {
+        state ^= state >> 12
+        state ^= state << 25
+        state ^= state >> 27
+        let v = state &* 2685821657736338717
+        return Float(v >> 40) * (1.0 / 16777216.0)
+    }
+
+    mutating func next(in range: ClosedRange<Float>) -> Float {
+        range.lowerBound + next01() * (range.upperBound - range.lowerBound)
+    }
+}
+
 private final class RingBuffer {
     private var storage: [TrailPoint]
     private(set) var head = 0
@@ -149,6 +242,8 @@ final class OverlayController {
 
     func setColor(_ color: SIMD4<Float>) { view.setColor(color) }
 
+    func burst(globalPoint: CGPoint) { view.burst(at: localPoint(globalPoint)) }
+
     func shutdown() {
         view.shutdown()
         window.orderOut(nil)
@@ -180,6 +275,15 @@ private final class MetalOverlayView: NSView {
     private let points: RingBuffer
     private let vertexBuffer: MTLBuffer
     private let vertexPointer: UnsafeMutablePointer<TrailVertex>
+    private let particlePipeline: MTLRenderPipelineState
+    private let particles: ParticleRing
+    private let particleBuffer: MTLBuffer
+    private let particlePointer: UnsafeMutablePointer<ParticleVertex>
+    /// Pointer travel since the last confetto, carried across samples so the
+    /// spacing is a property of the path rather than of the event rate.
+    private var emissionCarry: Float = 0
+    private var pendingSpawns: [SpawnRequest] = []
+    private var random: FastRandom
     private let passDescriptor = MTLRenderPassDescriptor()
     private let contentScale: Float
     private var lastPoint: SIMD2<Float>?
@@ -224,6 +328,17 @@ private final class MetalOverlayView: NSView {
     private var pending: [TrailPoint]
     private var pendingCount = 0
 
+    /// Where and how many particles to spawn. The monitors decide *that* a
+    /// spawn is due; the render thread decides what it looks like and writes
+    /// the vertices, because it is the only thread allowed to touch the
+    /// buffers the GPU is reading.
+    private struct SpawnRequest {
+        var p: SIMD2<Float>
+        var count: Int
+        var burst: Bool
+    }
+    private static let maxPendingSpawns = 16
+
     // Cached hot-path scalars so the sample gate touches no struct fields.
     private let minSampleDistanceSquared: Float
     private let minSampleInterval: Double
@@ -240,6 +355,16 @@ private final class MetalOverlayView: NSView {
         self.trailColor = color
         self.tailColor = TrailColorMath.rotatingHue(of: color, by: mode.tailHueShift)
         self.points = RingBuffer(capacity: config.maxPoints)
+        self.particles = ParticleRing(capacity: config.maxParticles)
+        // Seeded off the screen's position so two displays do not throw
+        // identical confetti. `truncatingIfNeeded` rather than `Int64(...)`:
+        // that one is a checked conversion, and a display sitting at a negative
+        // origin has the sign bit set in its bit pattern, which overflows Int64
+        // and traps. Only ever reachable with a second display.
+        let originBits = UInt64(truncatingIfNeeded: screen.frame.origin.x.bitPattern)
+            &* 0x9E3779B97F4A7C15
+            &+ UInt64(truncatingIfNeeded: screen.frame.origin.y.bitPattern)
+        self.random = FastRandom(seed: originBits)
         self.pending = Array(repeating: TrailPoint(p: .zero, t: 0), count: MetalOverlayView.maxPendingSamples)
         self.minSampleDistanceSquared = config.minSampleDistance * config.minSampleDistance
         self.minSampleInterval = config.minSampleInterval
@@ -255,9 +380,18 @@ private final class MetalOverlayView: NSView {
         self.vertexBuffer = vb
         self.vertexPointer = vb.contents().bindMemory(to: TrailVertex.self, capacity: maxVertices)
 
+        // Six vertices per particle, doubled like the trail's so any live run
+        // is one contiguous draw even when the ring wraps.
+        let maxParticleVertices = config.maxParticles * 12
+        guard let pb = device.makeBuffer(length: MemoryLayout<ParticleVertex>.stride * maxParticleVertices, options: [.storageModeShared]) else { return nil }
+        self.particleBuffer = pb
+        self.particlePointer = pb.contents().bindMemory(to: ParticleVertex.self, capacity: maxParticleVertices)
+
         guard let library = MetalOverlayView.loadLibrary(device: device),
               let vertex = library.makeFunction(name: "trailVertex"),
-              let fragment = library.makeFunction(name: "trailFragment") else { return nil }
+              let fragment = library.makeFunction(name: "trailFragment"),
+              let particleVertex = library.makeFunction(name: "particleVertex"),
+              let particleFragment = library.makeFunction(name: "particleFragment") else { return nil }
 
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction = vertex
@@ -273,6 +407,17 @@ private final class MetalOverlayView: NSView {
             self.pipeline = try device.makeRenderPipelineState(descriptor: desc)
         } catch {
             fputs("CursorTrail: pipeline creation failed: \(error)\n", stderr)
+            return nil
+        }
+
+        // Same blend state, different shaders: particles are ordinary
+        // source-over sprites drawn after the trail in the same pass.
+        desc.vertexFunction = particleVertex
+        desc.fragmentFunction = particleFragment
+        do {
+            self.particlePipeline = try device.makeRenderPipelineState(descriptor: desc)
+        } catch {
+            fputs("CursorTrail: particle pipeline creation failed: \(error)\n", stderr)
             return nil
         }
 
@@ -312,6 +457,8 @@ private final class MetalOverlayView: NSView {
         stateLock.lock()
         points.removeAll()
         pendingCount = 0
+        emissionCarry = 0
+        pendingSpawns.removeAll(keepingCapacity: true)
         pointerSpeed = 0
         tier = .full
         applyTierUnlocked()
@@ -350,6 +497,16 @@ private final class MetalOverlayView: NSView {
             }
         }
 
+        if let style = mode.particles, style.trigger == .movement, let previous = lastPoint {
+            emissionCarry += simd_length(p - previous)
+            let spacing = max(style.spacing, 0.5)
+            if emissionCarry >= spacing {
+                let due = Int(emissionCarry / spacing)
+                emissionCarry -= Float(due) * spacing
+                queueSpawnUnlocked(SpawnRequest(p: p, count: due, burst: false))
+            }
+        }
+
         lastPoint = p
         lastSampleTime = now
         if pendingCount < pending.count {
@@ -363,10 +520,42 @@ private final class MetalOverlayView: NSView {
         stateLock.unlock()
     }
 
+    /// A triple click landed on this display. Ignored unless the active mode
+    /// actually wants bursts, so the monitor can stay installed for every mode.
+    func burst(at p: SIMD2<Float>) {
+        stateLock.lock()
+        guard let style = mode.particles, style.trigger == .tripleClick else {
+            stateLock.unlock()
+            return
+        }
+        queueSpawnUnlocked(SpawnRequest(p: p, count: style.burstCount, burst: true))
+        requestFramesUnlocked()
+        stateLock.unlock()
+    }
+
+    /// Caller must hold `stateLock`.
+    private func queueSpawnUnlocked(_ request: SpawnRequest) {
+        guard request.count > 0 else { return }
+        if pendingSpawns.count < MetalOverlayView.maxPendingSpawns {
+            pendingSpawns.append(request)
+        } else {
+            // The render thread has not run in a long while. Fold the newest
+            // request into the last one rather than growing without bound; the
+            // particles land a few pixels off where they were asked for, which
+            // is invisible next to losing them.
+            pendingSpawns[pendingSpawns.count - 1].count += request.count
+        }
+    }
+
     func setMode(_ mode: TrailMode) {
         stateLock.lock()
         self.mode = mode
         self.tailColor = TrailColorMath.rotatingHue(of: trailColor, by: mode.tailHueShift)
+        // Confetti already in the air belongs to the mode that threw it, and
+        // it would be wrong to keep drawing it with the new mode's physics.
+        particles.removeAll()
+        emissionCarry = 0
+        pendingSpawns.removeAll(keepingCapacity: true)
         stateLock.unlock()
     }
 
@@ -473,6 +662,63 @@ private final class MetalOverlayView: NSView {
         return n
     }
 
+    /// Two triangles, wound so one `.triangle` draw covers every particle.
+    private static let quadCorners: [SIMD2<Float>] = [
+        SIMD2(-1, -1), SIMD2(1, -1), SIMD2(-1, 1),
+        SIMD2(-1, 1), SIMD2(1, -1), SIMD2(1, 1),
+    ]
+
+    /// Caller must hold `stateLock`; runs on the render thread. Turns each
+    /// queued request into particles and writes their vertices once -- after
+    /// this the GPU derives everything else from the vertex's age.
+    private func drainSpawnsUnlocked(style: ParticleStyle, nowAbsolute: Double) {
+        guard !pendingSpawns.isEmpty else { return }
+        let birth = Float(nowAbsolute - timeOrigin)
+
+        for request in pendingSpawns {
+            for _ in 0..<request.count {
+                // A burst goes out in every direction; movement throws the
+                // paper up and off the pointer within a cone.
+                let angle = request.burst
+                    ? random.next01() * 2 * .pi
+                    : .pi / 2 + (random.next01() * 2 - 1) * style.spread
+                let speed = random.next(in: style.speed)
+                let velocity = SIMD2(cos(angle), sin(angle)) * speed * contentScale
+
+                let spin: Float
+                if style.spin.lowerBound >= style.spin.upperBound {
+                    spin = 0
+                } else {
+                    let magnitude = random.next(in: style.spin)
+                    spin = random.next01() < 0.5 ? -magnitude : magnitude
+                }
+
+                let physical = particles.append(birthTime: nowAbsolute)
+                let vertex = ParticleVertex(
+                    origin: request.p * contentScale,
+                    velocity: velocity,
+                    birthTime: birth,
+                    hue: style.randomHue ? random.next01() : -1,
+                    // Vary the size a little: identical confetti reads as a
+                    // texture rather than as separate pieces of paper.
+                    size: style.size * contentScale * (0.7 + 0.6 * random.next01()),
+                    spin: spin,
+                    corner: .zero
+                )
+
+                let base = physical * 6
+                let mirror = (physical + config.maxParticles) * 6
+                for i in 0..<6 {
+                    var v = vertex
+                    v.corner = MetalOverlayView.quadCorners[i]
+                    particlePointer[base + i] = v
+                    particlePointer[mirror + i] = v
+                }
+            }
+        }
+        pendingSpawns.removeAll(keepingCapacity: true)
+    }
+
     private func writeVertexPair(logicalIndex: Int, physicalIndex explicitPhysical: Int? = nil) {
         guard logicalIndex >= 0, logicalIndex < points.count else { return }
         let physical = explicitPhysical ?? points.physicalIndex(logicalIndex)
@@ -507,15 +753,34 @@ private final class MetalOverlayView: NSView {
         let appended = drainPendingUnlocked()
         let count = points.count
 
+        if let style = mode.particles {
+            particles.removeExpired(before: nowAbsolute - Double(style.lifetime))
+            drainSpawnsUnlocked(style: style, nowAbsolute: nowAbsolute)
+        } else if particles.count > 0 {
+            particles.removeAll()
+        }
+        let particleCount = particles.count
+        let particleStart = particles.head * 6
+
         // A frame with no new sample means the pointer has stopped or is
         // crawling; let the average fall so the fade-out settles at half rate.
         if appended == 0 { pointerSpeed *= 0.7 }
-        if tier == .full && pointerSpeed < MetalOverlayView.demoteSpeed {
+        if particleCount > 0 {
+            // Particles are the one thing on screen that moves independently of
+            // the pointer, and sparks cross a display far faster than a pointer
+            // ever does. Half rate would strobe them, so hold full rate until
+            // the last one dies -- a cost only the particle modes pay.
+            if tier == .reduced {
+                tier = .full
+                applyTierUnlocked()
+            }
+        } else if tier == .full && pointerSpeed < MetalOverlayView.demoteSpeed {
             tier = .reduced
             applyTierUnlocked()
         }
 
-        if count < 2 {
+        let drawTrail = count >= 2
+        if !drawTrail && particleCount == 0 {
             // The last frame with a drawable trail had every point at the end of
             // its life, so it faded to nothing; there is no stale pixel to clear.
             wantsFrames = false
@@ -526,7 +791,7 @@ private final class MetalOverlayView: NSView {
 
         // Appending shifts tangents for the new points and their predecessor;
         // expiring (or wrapping) the head shifts the tangent of the new point 0.
-        if headChanged || appended > 0 {
+        if drawTrail && (headChanged || appended > 0) {
             writeVertexPair(logicalIndex: 0)
             var i = max(1, count - appended - 1)
             while i < count {
@@ -547,27 +812,46 @@ private final class MetalOverlayView: NSView {
             return
         }
 
-        encoder.setRenderPipelineState(pipeline)
-        encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
-
         // The window is screen-aligned and stationary, so vertex centres -- which
         // are display-local points scaled to pixels -- are already drawable
         // coordinates. No origin to subtract, and nothing to get out of step.
         let viewport = SIMD2(Float(metalLayer.drawableSize.width), Float(metalLayer.drawableSize.height))
-        for passStyle in mode.passes {
-            drawPass(
-                encoder: encoder,
-                vertexStart: vertexStart,
-                vertexCount: count * 2,
+
+        if drawTrail {
+            encoder.setRenderPipelineState(pipeline)
+            encoder.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+            for passStyle in mode.passes {
+                drawPass(
+                    encoder: encoder,
+                    vertexStart: vertexStart,
+                    vertexCount: count * 2,
+                    viewport: viewport,
+                    now: now,
+                    mode: mode,
+                    color: color,
+                    tailColor: tail,
+                    widthScale: passStyle.widthScale,
+                    alpha: passStyle.alpha,
+                    softness: passStyle.softness
+                )
+            }
+        }
+
+        if particleCount > 0, let style = mode.particles {
+            var uniforms = ParticleUniforms(
                 viewport: viewport,
                 now: now,
-                mode: mode,
-                color: color,
-                tailColor: tail,
-                widthScale: passStyle.widthScale,
-                alpha: passStyle.alpha,
-                softness: passStyle.softness
+                lifetime: style.lifetime,
+                gravity: style.gravity * contentScale,
+                roundness: style.roundness,
+                flutter: style.flutter ? 1 : 0,
+                color: color
             )
+            encoder.setRenderPipelineState(particlePipeline)
+            encoder.setVertexBuffer(particleBuffer, offset: 0, index: 0)
+            encoder.setVertexBytes(&uniforms, length: MemoryLayout<ParticleUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&uniforms, length: MemoryLayout<ParticleUniforms>.stride, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: particleStart, vertexCount: particleCount * 6)
         }
 
         encoder.endEncoding()

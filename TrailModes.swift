@@ -9,6 +9,38 @@ enum TrailColoring: UInt32 {
     case rainbow = 2
 }
 
+/// What makes a mode emit particles. Movement emits along the pointer's path;
+/// tripleClick waits for a burst.
+enum ParticleTrigger {
+    case movement
+    case tripleClick
+}
+
+struct ParticleStyle {
+    let trigger: ParticleTrigger
+    /// Movement only: points of pointer travel between one particle and the
+    /// next. Distance rather than time, so a slow drag does not carpet the
+    /// screen and a flick does not leave gaps.
+    let spacing: Float
+    /// tripleClick only: how many particles one burst emits.
+    let burstCount: Int
+    let speed: ClosedRange<Float>
+    /// Half-angle of the emission cone, in radians, measured off straight up.
+    /// `.pi` is the whole circle.
+    let spread: Float
+    /// Pixels per second squared. Negative falls, because the overlay's
+    /// coordinate space has y pointing up.
+    let gravity: Float
+    let lifetime: Float
+    let size: Float
+    let spin: ClosedRange<Float>
+    /// 0 draws soft squares, 1 soft discs.
+    let roundness: Float
+    let flutter: Bool
+    /// Each particle picks its own hue rather than taking the trail's colour.
+    let randomHue: Bool
+}
+
 struct TrailPassStyle {
     let widthScale: Float
     let alpha: Float
@@ -29,6 +61,7 @@ struct TrailMode {
     let hueSpread: Float
     let hueSpeed: Float
     let passes: [TrailPassStyle]
+    let particles: ParticleStyle?
 
     init(
         id: String,
@@ -39,7 +72,8 @@ struct TrailMode {
         tailHueShift: Float = 0,
         hueSpread: Float = 0,
         hueSpeed: Float = 0,
-        passes: [TrailPassStyle]
+        passes: [TrailPassStyle],
+        particles: ParticleStyle? = nil
     ) {
         self.id = id
         self.title = title
@@ -50,11 +84,16 @@ struct TrailMode {
         self.hueSpread = hueSpread
         self.hueSpeed = hueSpeed
         self.passes = passes
+        self.particles = particles
     }
 
     /// False when the mode generates its own hues, and the chosen colour only
     /// contributes its opacity. The menu bar says so rather than looking broken.
-    var usesTrailColor: Bool { coloring != .rainbow }
+    var usesTrailColor: Bool {
+        if coloring == .rainbow { return false }
+        if let particles, particles.randomHue, passes.isEmpty { return false }
+        return true
+    }
 }
 
 enum TrailModeRegistry {
@@ -125,6 +164,64 @@ enum TrailModeRegistry {
                 TrailPassStyle(widthScale: 1.6, alpha: 0.16, softness: 0.95),
                 TrailPassStyle(widthScale: 1.0, alpha: 0.22, softness: 0.90),
             ]
+        ),
+        TrailMode(
+            id: "confetti",
+            title: "Confetti",
+            lifetime: 0.34,
+            headWidth: 10.0,
+            // A quieter trail than Comet's: the paper is the subject here, and
+            // a bright core behind it just muddies the colours.
+            passes: [
+                TrailPassStyle(widthScale: 1.8, alpha: 0.14, softness: 0.95),
+                TrailPassStyle(widthScale: 1.0, alpha: 0.55, softness: 0.55),
+            ],
+            particles: ParticleStyle(
+                trigger: .movement,
+                spacing: 14.0,
+                burstCount: 0,
+                speed: 70...200,
+                // Biased upward rather than radial, so the paper is thrown off
+                // the pointer and then falls, instead of spraying evenly.
+                spread: 1.15,
+                // Well under real gravity. At anything like 900 the paper drops
+                // roughly 600 points inside its lifetime -- more than half a
+                // display -- and reads as being sucked downward rather than
+                // fluttering. This falls about 200.
+                gravity: -260,
+                lifetime: 1.25,
+                size: 4.5,
+                spin: 6...16,
+                roundness: 0.15,
+                flutter: true,
+                randomHue: true
+            )
+        ),
+        TrailMode(
+            id: "firework",
+            title: "Firework",
+            lifetime: 0.40,
+            headWidth: 13.0,
+            passes: [
+                TrailPassStyle(widthScale: 2.2, alpha: 0.16, softness: 1.00),
+                TrailPassStyle(widthScale: 1.0, alpha: 0.70, softness: 0.50),
+            ],
+            particles: ParticleStyle(
+                trigger: .tripleClick,
+                spacing: 0,
+                burstCount: 72,
+                speed: 200...460,
+                spread: .pi,
+                // Enough droop to arc the burst without collapsing it before
+                // the sparks have finished spreading.
+                gravity: -520,
+                lifetime: 1.00,
+                size: 3.0,
+                spin: 0...0,
+                roundness: 1.0,
+                flutter: false,
+                randomHue: true
+            )
         ),
     ]
 

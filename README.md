@@ -9,7 +9,7 @@ A tiny, native macOS cursor-trail utility focused on low overhead, smooth render
 - Fixed-capacity ring buffer for trail samples
 - Shared Metal vertex buffer; no per-frame trail arrays
 - Native menu bar mode and colour pickers, both persistent
-- Five built-in modes: **Comet**, **Line**, **Rainbow Road**, **Gradient**, **Blur**
+- Seven built-in modes, including particle modes: **Confetti** and **Firework**
 - Mode registry designed so new modes can be added without changing the input/render core
 - Transparent click-through overlay per display
 - Only a display that currently has a fading trail renders
@@ -95,14 +95,34 @@ Built-in modes:
 | **Rainbow Road** | hues sweep down the trail and scroll over time | 3 | its own |
 | **Gradient** | your colour at the head, fading into a hue-rotated tail | 2 | your colour |
 | **Blur** | a wide, diffuse smudge with no hard edge | 5 | your colour |
+| **Confetti** | paper thrown off the pointer as it moves, fluttering down | 2 + particles | its own |
+| **Firework** | a burst of sparks on a triple click | 2 + particles | its own |
 
 **Blur** has no separate blur pass. Stacking wide, fully soft, nearly transparent strips over each other sums to the same falloff, and each extra pass is one more `drawPrimitives` on a vertex buffer that is already bound — no second render target, no read-back.
 
 **Rainbow Road** picks its hue from how far down the trail a fragment sits, so the pattern is anchored to the pointer and scrolls with time rather than with position on screen. **Gradient** derives its tail colour by rotating your chosen colour's hue; pick a near-grey and it lifts the saturation so the tail is still a visibly different colour.
 
+## Particle modes
+
+**Confetti** emits along the pointer's path — one piece per 14 points of travel, so the spacing is a property of the path rather than of the event rate: a slow drag does not carpet the screen and a flick does not leave gaps. **Firework** waits for a triple click and throws 72 sparks radially from it. Both keep drawing their trail underneath.
+
+A particle's whole path is decided the moment it spawns, so its six vertices are written once and never touched again; position, rotation and fade are evaluated from the vertex's age in the vertex shader. This is the same trick the trail uses for its fade, for the same reason — the CPU does no per-frame particle work, and a frame drawing hundreds of particles is one draw call with no buffer traffic. Motion is ballistic with no drag term: drag has no closed form this cheap, and at these speeds nobody can tell it is missing.
+
+Gravity is well under the real thing. At anything like a realistic value the confetti drops some 600 points inside its lifetime — more than half a display — and reads as being sucked downward rather than fluttering.
+
+### Triple click is also a text gesture
+
+Triple-clicking selects a paragraph in most editors, so in **Firework** mode selecting text sets off a burst. If that gets in the way, change the gesture:
+
+```sh
+CURSORTRAIL_BURST_CLICKS=4 ./run.sh
+```
+
+Detection uses AppKit's own `clickCount`, which is already measured against your system double-click interval, so there is no separate timing threshold to tune.
+
 ### Adding another mode
 
-Modes are declared in `TrailModes.swift`. Add one `TrailMode` entry to `TrailModeRegistry.all`; the menu bar is generated automatically. A mode controls its lifetime, width, its colouring (`.solid`, `.gradient`, `.rainbow`), and one-or-more GPU passes. The mouse monitoring, ring buffer, display-link lifecycle, and overlay code do not need to change.
+Modes are declared in `TrailModes.swift`. Add one `TrailMode` entry to `TrailModeRegistry.all`; the menu bar is generated automatically. A mode controls its lifetime, width, its colouring (`.solid`, `.gradient`, `.rainbow`), one-or-more GPU passes, and optionally a `ParticleStyle`. The mouse monitoring, ring buffer, display-link lifecycle, and overlay code do not need to change.
 
 A genuinely new *kind* of colouring needs one more branch in `trailFragment` and one more case in `TrailColoring`. That enum's raw values are the wire format of the `coloring` uniform, so they cannot be renumbered on their own.
 
@@ -130,6 +150,8 @@ Available options:
 | `CURSORTRAIL_SAMPLE_DISTANCE` | `0.75` | Minimum movement, in points, before a new sample |
 | `CURSORTRAIL_SAMPLE_INTERVAL` | `0.00833` | Minimum time, in seconds, between samples (120 Hz) |
 | `CURSORTRAIL_MAX_POINTS` | `256` | Fixed ring-buffer capacity |
+| `CURSORTRAIL_MAX_PARTICLES` | `512` | Live particles per display, for the modes that emit any |
+| `CURSORTRAIL_BURST_CLICKS` | `3` | Clicks within the double-click interval that set off a firework |
 | `CURSORTRAIL_COLOR` | `0.35,0.72,1.0,0.95` | Initial RGBA components, each 0...1; the menu bar picker overrides it once used |
 | `CURSORTRAIL_MAX_FPS` | `0` | Cap the render rate; `0` follows the display |
 | `CURSORTRAIL_ADAPTIVE_FPS` | `1` | Halve the render rate while the pointer is slow or the trail is fading; `0` always renders at the full rate |
@@ -155,6 +177,8 @@ Mouse events do no geometry work of their own. The monitors only gate the sample
 Putting a frame on screen costs about a millisecond of CPU inside CoreAnimation and Metal regardless of how little it draws, so the cheapest frame is the one that is never presented. The display link runs at the display's full rate only while the pointer is moving fast enough for consecutive frames to land visibly apart; below 400 pt/s, and through the fade after the pointer stops, it drops to half rate (floored at 30). Crossing back above 700 pt/s promotes it from the sampling path rather than the next frame, so the start of a flick is never the frame that goes missing.
 
 Sampling is untouched by this - points still arrive at up to 120 Hz and still land in the ring - so the shape of the trail is identical either way. Only how often that shape is presented changes. `CURSORTRAIL_ADAPTIVE_FPS=0` pins the full rate; `CURSORTRAIL_MAX_FPS` caps it.
+
+Particles are the exception. They are the one thing on screen that moves independently of the pointer, and a spark crosses a display far faster than a pointer ever does, so half rate strobes them visibly. While any particle is alive the link is held at full rate. Only the two particle modes ever pay that, and only until the last particle dies.
 
 ### Multi-display
 
