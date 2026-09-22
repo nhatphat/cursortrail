@@ -17,6 +17,12 @@ struct TrailConfig {
     let minSampleDistance: Float = envFloat("CURSORTRAIL_SAMPLE_DISTANCE", 0.75)
     let minSampleInterval: Double = Double(envFloat("CURSORTRAIL_SAMPLE_INTERVAL", 1.0 / 120.0))
     let maxPoints: Int = min(max(envInt("CURSORTRAIL_MAX_POINTS", 256), 32), 2048)
+    /// Live particles per display, for the modes that emit any. Reached only
+    /// during a burst; confetti settles far below it.
+    let maxParticles: Int = min(max(envInt("CURSORTRAIL_MAX_PARTICLES", 512), 32), 4096)
+    /// Overrides every mode's own click gesture when set. 0 leaves each mode
+    /// to ask for the number of clicks it wants.
+    let burstClickOverride: Int = min(max(envInt("CURSORTRAIL_BURST_CLICKS", 0), 0), 5)
     /// 0 = follow the display's native refresh rate. Set e.g. 60 on a 120 Hz
     /// ProMotion panel to halve the render work while the trail is alive.
     let maxFPS: Int = max(envInt("CURSORTRAIL_MAX_FPS", 0), 0)
@@ -60,6 +66,8 @@ enum TrailColorPresets {
 final class CursorTrailApp: NSObject, NSApplicationDelegate {
     private static let modeDefaultsKey = "selectedTrailMode"
     private static let colorDefaultsKey = "trailColor"
+    private static let burstClicksDefaultsKey = "burstClicks"
+    private static let burstClickChoices = [1, 2, 3]
 
     private let config = TrailConfig()
     private var currentMode = TrailModeRegistry.defaultMode
@@ -67,10 +75,15 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     private var overlays: [OverlayController] = []
     private var globalMonitor: Any?
     private var localMonitor: Any?
+    private var globalClickMonitor: Any?
+    private var localClickMonitor: Any?
     private var activeOverlay: OverlayController?
     private var statusItem: NSStatusItem?
     private var modeMenuItems: [String: NSMenuItem] = [:]
     private var colorMenuItems: [NSMenuItem] = []
+    private var burstClicksMenuItems: [NSMenuItem] = []
+    private var burstNoteItem: NSMenuItem?
+    private var currentBurstClicks = 1
     /// Shown only while the active mode generates its own hues, so the swatches
     /// having no visible effect reads as intended rather than broken.
     private var colorNoteItem: NSMenuItem?
@@ -88,6 +101,10 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         // The environment variable is the default, not an override: a colour
         // picked from the menu bar has been chosen more deliberately.
         currentColor = Self.decodeColor(UserDefaults.standard.string(forKey: Self.colorDefaultsKey)) ?? config.color
+        let storedClicks = UserDefaults.standard.integer(forKey: Self.burstClicksDefaultsKey)
+        currentBurstClicks = Self.burstClickChoices.contains(storedClicks)
+            ? storedClicks
+            : (config.burstClickOverride > 0 ? config.burstClickOverride : 1)
         setupStatusItem()
         rebuildOverlays()
         installMouseMonitors()
@@ -102,6 +119,8 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         if let globalMonitor { NSEvent.removeMonitor(globalMonitor) }
         if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        if let globalClickMonitor { NSEvent.removeMonitor(globalClickMonitor) }
+        if let localClickMonitor { NSEvent.removeMonitor(localClickMonitor) }
     }
 
     @objc private func screensChanged() {
@@ -133,6 +152,10 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         colorItem.submenu = buildColorMenu()
         menu.addItem(colorItem)
 
+        let burstItem = NSMenuItem(title: "Firework Clicks", action: nil, keyEquivalent: "")
+        burstItem.submenu = buildBurstMenu()
+        menu.addItem(burstItem)
+
         menu.addItem(.separator())
         let quit = NSMenuItem(title: "Quit CursorTrail", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
@@ -142,6 +165,45 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         statusItem = item
         refreshModeChecks()
         refreshColorChecks()
+        refreshBurstChecks()
+    }
+
+    private func buildBurstMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let note = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        note.isHidden = true
+        menu.addItem(note)
+        burstNoteItem = note
+
+        for clicks in Self.burstClickChoices {
+            let title = clicks == 1 ? "Single Click" : "\(clicks) Clicks"
+            let item = NSMenuItem(title: title, action: #selector(selectBurstClicks(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = clicks
+            menu.addItem(item)
+            burstClicksMenuItems.append(item)
+        }
+
+        return menu
+    }
+
+    @objc private func selectBurstClicks(_ sender: NSMenuItem) {
+        guard let clicks = sender.representedObject as? Int else { return }
+        currentBurstClicks = clicks
+        UserDefaults.standard.set(clicks, forKey: Self.burstClicksDefaultsKey)
+        refreshBurstChecks()
+    }
+
+    private func refreshBurstChecks() {
+        for item in burstClicksMenuItems {
+            guard let clicks = item.representedObject as? Int else { continue }
+            item.state = (clicks == currentBurstClicks) ? .on : .off
+        }
+        let modeBursts = currentMode.emitters.contains { $0.trigger == .click }
+        burstNoteItem?.isHidden = modeBursts
+        burstNoteItem?.title = "\(currentMode.title) has no burst"
     }
 
     private func buildColorMenu() -> NSMenu {
@@ -260,6 +322,7 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         overlays.forEach { $0.setMode(mode) }
         refreshModeChecks()
         refreshColorChecks()
+        refreshBurstChecks()
     }
 
     private func refreshModeChecks() {
@@ -289,7 +352,31 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
             return event
         }
 
+        // AppKit already counts multi-clicks against the user's double-click
+        // interval, so `clickCount` is the whole gesture detector. Both monitors
+        // only observe -- the click still reaches whatever was under it.
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            self?.handleClick(event)
+        }
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+            self?.handleClick(event)
+            return event
+        }
+
         sampleMouse(force: true)
+    }
+
+    private func handleClick(_ event: NSEvent) {
+        // Which counts matter is the active mode's business, not this monitor's.
+        let clicks = event.clickCount
+        guard clicks > 0 else { return }
+        let global = NSEvent.mouseLocation
+        if let active = activeOverlay, NSMouseInRect(global, active.screen.frame, false) {
+            active.burst(globalPoint: global, clickCount: clicks, wantedClicks: currentBurstClicks)
+            return
+        }
+        overlays.first(where: { NSMouseInRect(global, $0.screen.frame, false) })?
+            .burst(globalPoint: global, clickCount: clicks, wantedClicks: currentBurstClicks)
     }
 
     private func sampleMouse(force: Bool = false) {
