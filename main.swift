@@ -673,7 +673,12 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
             guard let self else { return }
             if toggle { self.trailEnabled.toggle() }
             self.pauseMenuItem?.title = self.trailEnabled ? "Pause Trail" : "Resume Trail"
-            if !self.trailEnabled { self.activeOverlay = nil }
+            if !self.trailEnabled {
+                self.activeOverlay = nil
+                // Everything else on screen expires within a second, but a cat
+                // would sit there through the whole screen share.
+                self.overlays.forEach { $0.releaseCompanion() }
+            }
         }
     }
 
@@ -740,6 +745,9 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         }
 
         guard let overlay = overlays.first(where: { NSMouseInRect(global, $0.screen.frame, false) }) else { return }
+        // The pointer has crossed to another display: the cat comes with it
+        // rather than being left sitting on the one you walked away from.
+        activeOverlay?.releaseCompanion()
         activeOverlay = overlay
         overlay.beginAt(globalPoint: global)
     }

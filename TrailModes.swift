@@ -176,6 +176,32 @@ struct RippleStyle {
     }
 }
 
+/// Something that follows the pointer rather than being thrown by it. A
+/// companion is not a particle: it is one persistent thing with a position, a
+/// pose and a memory of where the pointer has been, so it walks the path the
+/// pointer actually took instead of cutting the corner.
+struct CompanionStyle {
+    /// Points per second at an ordinary trot, and the cap it sprints to when
+    /// the pointer has got a long way ahead.
+    let speed: Float
+    let sprintSpeed: Float
+    /// Half the drawn height, in points.
+    let size: Float
+    /// Points to the right of the path the companion is actually drawn. It
+    /// walks where the pointer walked, but sitting exactly on the hotspot puts
+    /// it between you and whatever you were about to click.
+    let sideOffset: Float
+    /// Points of pointer travel between waypoints. The path is thinned to this
+    /// on the way in, so a slow drag does not lay down hundreds of points a
+    /// second for the walk to chew through.
+    let waypointSpacing: Float
+    /// How far ahead the pointer has to be before the sprint starts.
+    let catchRadius: Float
+    /// Seconds standing still before it sits, and before it lies down asleep.
+    let sitDelay: Float
+    let sleepDelay: Float
+}
+
 /// An effect that can be switched on independently of the trail's look,
 /// and independently of every other effect. The menu bar lists these as checks
 /// rather than as a choice, so any combination is reachable.
@@ -184,12 +210,14 @@ struct TrailEffect {
     let title: String
     let particles: ParticleStyle?
     let ripple: RippleStyle?
+    let companion: CompanionStyle?
 
-    init(id: String, title: String, particles: ParticleStyle? = nil, ripple: RippleStyle? = nil) {
+    init(id: String, title: String, particles: ParticleStyle? = nil, ripple: RippleStyle? = nil, companion: CompanionStyle? = nil) {
         self.id = id
         self.title = title
         self.particles = particles
         self.ripple = ripple
+        self.companion = companion
     }
 
     /// Amount and shape are chosen for confetti in particular, so they reach
@@ -201,7 +229,8 @@ struct TrailEffect {
             id: id,
             title: title,
             particles: particles.spaced(by: amount).shaped(as: shape),
-            ripple: ripple
+            ripple: ripple,
+            companion: companion
         )
     }
 
@@ -211,7 +240,10 @@ struct TrailEffect {
             id: id,
             title: title,
             particles: particles?.fading(by: scale),
-            ripple: ripple?.fading(by: scale)
+            ripple: ripple?.fading(by: scale),
+            // A cat does not fade out, so it has no fade to scale: it walks
+            // off, sits down and stays until you switch it off.
+            companion: companion
         )
     }
 }
@@ -236,6 +268,9 @@ struct TrailMode {
 
     var emitters: [ParticleStyle] { effects.compactMap(\.particles) }
     var ripples: [RippleStyle] { effects.compactMap(\.ripple) }
+    /// One at most: two companions would want the same path and stand on each
+    /// other, so the first one switched on is the one that walks.
+    var companion: CompanionStyle? { effects.compactMap(\.companion).first }
 
     /// False when the style generates its own hues, and the chosen colour only
     /// contributes its opacity. The menu bar says so rather than looking broken.
@@ -404,6 +439,25 @@ enum TrailEffectRegistry {
             )
         ),
         rippleEffect,
+        TrailEffect(
+            id: "cat",
+            title: "Cat",
+            companion: CompanionStyle(
+                // Faster than a comfortable pointer speed but slower than a
+                // flick, so it is usually just behind you and occasionally has
+                // to run for it.
+                speed: 460,
+                sprintSpeed: 1500,
+                size: 26,
+                // Clears the arrow and its shadow with a little daylight left,
+                // without the cat looking detached from the path it is on.
+                sideOffset: 34,
+                waypointSpacing: 9,
+                catchRadius: 34,
+                sitDelay: 0.9,
+                sleepDelay: 5.0
+            )
+        ),
     ]
 
     static let rippleEffect = TrailEffect(

@@ -107,6 +107,7 @@ Effects:
 | **Confetti** | movement | paper thrown off the pointer, fluttering down |
 | **Firework** | a click | 72 sparks radially from the click |
 | **Click Ripple** | a click | a train of rings spreading out and fading |
+| **Cat** | movement | a cat that walks the path you took, then sits, then sleeps |
 
 **Blur** has no separate blur pass. Stacking wide, fully soft, nearly transparent strips over each other sums to the same falloff, and each extra pass is one more `drawPrimitives` on a vertex buffer that is already bound — no second render target, no read-back.
 
@@ -137,6 +138,50 @@ Two more submenus, both confetti's own. **Confetti Amount** runs **Very Sparse**
 **Confetti Shape** offers **Paper** (the original: near-square, fluttering), **Dots**, **Ribbons** and **Bubbles**. A shape is four numbers on the particle — size, roundness, aspect and flutter — plus the spin that goes with it, so none of them is a new geometry path in the shader. **Ribbons** narrows the quad to roughly a quarter of its length; the fragment masks the same unit square either way, so the drawn piece narrows with the geometry, and the flutter turning it edge-on as it tumbles is most of what sells it. **Dots** and **Bubbles** do not spin at all, because a disc rotating about its centre is still the same disc.
 
 Both settings reach the movement emitters only. A firework is sparks, and sparks stay the points their own effect asked for.
+
+## The cat
+
+**Cat** is not a particle effect. Everything else here is thrown, fades and is
+forgotten; the cat is one persistent thing with a position, a pose and a memory
+of where the pointer has been. It walks the path the pointer actually took
+rather than the straight line to it, which is the whole point of it — the
+pointer's own route is the thing it is chasing.
+
+Waypoints are laid down as the pointer moves, thinned to nine points of travel
+apart so a slow drag does not queue hundreds a second, and the cat eats them
+from the front. How much path is left sets the pace: an ordinary trot at 460
+points a second, sprinting up to 1500 when the pointer has got a long way ahead,
+so it never strands itself a screen away. Past 512 waypoints the oldest are
+dropped, and the cat picks the path up further along instead of falling further
+behind for ever.
+
+It is drawn 34 points to the right of the path rather than on it. It still
+walks exactly where the pointer walked — only the drawing is offset — but
+sitting on the hotspot puts a cat between you and whatever you were about to
+click.
+
+Standing still for 0.9 s sits it down; five seconds lies it down asleep; any
+movement stands it back up. The three poses are blends, not states — the shader
+is handed a cat that is 40% of the way to sitting and draws exactly that, so it
+folds itself up instead of cutting between drawings.
+
+There is one cat per pointer, not per display: crossing to another screen takes
+it with you. Pausing with **⌃⌥⌘T** sends it away too, because unlike everything
+else on screen it would otherwise sit through your whole screen share.
+
+### How it is drawn
+
+One quad, no texture, no sprite sheet. The fragment shader is a signed distance
+field of the whole animal — body, haunch, four legs, a three-joint tail, head,
+two ears and an eye punched out as a hole in the silhouette — and a pose is the
+same shapes at different numbers. That is what makes sitting down a blend rather
+than an animation to author, and it is why the cat is drawn in your trail colour
+like everything else.
+
+The CPU rewrites one uniform struct per frame, which is all the traffic the
+effect costs. A sleeping cat still breathes, so the display link cannot park
+while it is on screen; a third frame tier runs it at 10 fps instead, and an
+otherwise idle machine measures the same as with no cat at all.
 
 ## Fade duration
 
@@ -170,7 +215,7 @@ Detection uses AppKit's own `clickCount`, which is already measured against your
 
 ### Adding another mode
 
-Styles and effects are declared in `TrailModes.swift`. Add a `TrailStyle` to `TrailStyleRegistry.all` or a `TrailEffect` to `TrailEffectRegistry.all`; the menu bar is generated from both, and because the two axes are independent a new entry needs no combination entry anywhere. A style controls lifetime, width, colouring (`.solid`, `.gradient`, `.rainbow`), speed response and its GPU passes. An effect carries a `ParticleStyle`, a `RippleStyle`, or both. The mouse monitoring, ring buffer, display-link lifecycle, and overlay code do not need to change.
+Styles and effects are declared in `TrailModes.swift`. Add a `TrailStyle` to `TrailStyleRegistry.all` or a `TrailEffect` to `TrailEffectRegistry.all`; the menu bar is generated from both, and because the two axes are independent a new entry needs no combination entry anywhere. A style controls lifetime, width, colouring (`.solid`, `.gradient`, `.rainbow`), speed response and its GPU passes. An effect carries a `ParticleStyle`, a `RippleStyle`, a `CompanionStyle`, or any combination. The mouse monitoring, ring buffer, display-link lifecycle, and overlay code do not need to change.
 
 A genuinely new *kind* of colouring needs one more branch in `trailFragment` and one more case in `TrailColoring`. That enum's raw values are the wire format of the `coloring` uniform, so they cannot be renumbered on their own.
 

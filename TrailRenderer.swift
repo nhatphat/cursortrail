@@ -56,6 +56,23 @@ private struct ParticleVertex {
     var aspect: Float
 }
 
+/// Mirrors `CatUniforms` in Trail.metal. One struct per frame rather than a
+/// vertex buffer: the companion is a single quad, and everything about it that
+/// changes is a pose parameter the fragment reads.
+private struct CatUniforms {
+    var viewport: SIMD2<Float>
+    var position: SIMD2<Float>
+    var size: Float
+    var facing: Float
+    var phase: Float
+    var run01: Float
+    var sit01: Float
+    var sleep01: Float
+    var now: Float
+    var pad: Float = 0
+    var color: SIMD4<Float>
+}
+
 /// Mirrors `RippleVertex` in Trail.metal.
 private struct RippleVertex {
     var origin: SIMD2<Float>
@@ -260,6 +277,11 @@ final class OverlayController {
 
     func setColor(_ color: SIMD4<Float>) { view.setColor(color) }
 
+    /// The pointer has moved to another display. Without this the cat would be
+    /// left behind to sit and then sleep on a screen the pointer is no longer
+    /// on, and a second one would appear over there: one pointer, one cat.
+    func releaseCompanion() { view.releaseCompanion() }
+
     func setPalette(_ palette: ParticlePalette) { view.setPalette(palette) }
 
     func burst(globalPoint: CGPoint, clickCount: Int, wantedClicks: Int) {
@@ -300,6 +322,7 @@ private final class MetalOverlayView: NSView {
     private let vertexPointer: UnsafeMutablePointer<TrailVertex>
     private let particlePipeline: MTLRenderPipelineState
     private let ripplePipeline: MTLRenderPipelineState
+    private let catPipeline: MTLRenderPipelineState
     /// Ripples are one per click, so a handful is plenty; the same ring and
     /// mirrored-buffer scheme as particles, at a much smaller capacity.
     private let ripples: ParticleRing
@@ -344,7 +367,11 @@ private final class MetalOverlayView: NSView {
     // Sampling is untouched by this -- points still arrive at up to 120 Hz and
     // still land in the ring -- so the trail's *shape* is identical either way;
     // only how often that shape is put on screen changes.
-    private enum FrameTier { case full, reduced }
+    /// `dozing` exists for the companion alone: a sleeping cat still breathes,
+    /// so the link cannot park, but ten frames a second is plenty for a slow
+    /// sine and it keeps an idle machine idle.
+    private enum FrameTier { case full, reduced, dozing }
+    private static let dozeFPS: Float = 10
     private var tier = FrameTier.full
     private let fullFPS: Float
     private let reducedFPS: Float
@@ -375,6 +402,29 @@ private final class MetalOverlayView: NSView {
         var emitter: Int
     }
     private static let maxPendingSpawns = 16
+
+    /// The companion's own copy of where the pointer has been, thinned to the
+    /// style's waypoint spacing and consumed from the front as it walks. A
+    /// separate queue from the trail's ring because the cat has to keep
+    /// walking a path the trail has already finished fading out.
+    private var catPath: [SIMD2<Float>] = []
+    private var catPathHead = 0
+    private static let maxCatWaypoints = 512
+    private var catLastWaypoint: SIMD2<Float>?
+    private var catPosition = SIMD2<Float>.zero
+    private var catSpawned = false
+    private var catFacing: Float = 1
+    private var catPhase: Float = 0
+    private var catRun: Float = 0
+    private var catSit: Float = 0
+    private var catSleep: Float = 0
+    private var catIdle: Float = 0
+    private var catLastUpdate: Double = 0
+    /// Everything else on screen fades out on its own, so a frame that draws
+    /// nothing leaves nothing behind. A companion does not fade: when it goes
+    /// away, one cleared frame has to be presented before the link parks, or
+    /// its last pose stays painted on the overlay.
+    private var needsClearFrame = false
 
     // Cached hot-path scalars so the sample gate touches no struct fields.
     private let minSampleDistanceSquared: Float
@@ -436,7 +486,9 @@ private final class MetalOverlayView: NSView {
               let particleVertex = library.makeFunction(name: "particleVertex"),
               let particleFragment = library.makeFunction(name: "particleFragment"),
               let rippleVertex = library.makeFunction(name: "rippleVertex"),
-              let rippleFragment = library.makeFunction(name: "rippleFragment") else { return nil }
+              let rippleFragment = library.makeFunction(name: "rippleFragment"),
+              let catVertex = library.makeFunction(name: "catVertex"),
+              let catFragment = library.makeFunction(name: "catFragment") else { return nil }
 
         let desc = MTLRenderPipelineDescriptor()
         desc.vertexFunction = vertex
@@ -472,6 +524,15 @@ private final class MetalOverlayView: NSView {
             self.ripplePipeline = try device.makeRenderPipelineState(descriptor: desc)
         } catch {
             fputs("CursorTrail: ripple pipeline creation failed: \(error)\n", stderr)
+            return nil
+        }
+
+        desc.vertexFunction = catVertex
+        desc.fragmentFunction = catFragment
+        do {
+            self.catPipeline = try device.makeRenderPipelineState(descriptor: desc)
+        } catch {
+            fputs("CursorTrail: companion pipeline creation failed: \(error)\n", stderr)
             return nil
         }
 
@@ -520,7 +581,13 @@ private final class MetalOverlayView: NSView {
         lastSampleTime = now
         let physical = points.append(TrailPoint(p: p, t: now))
         writeVertexPair(logicalIndex: 0, physicalIndex: physical)
-        if mode.drawsTrail { requestFramesUnlocked() }
+        if mode.companion != nil {
+            // The pointer has just arrived on this display, so there is no path
+            // behind it yet: the cat starts at your feet rather than walking in
+            // from wherever it last was.
+            spawnCatUnlocked(at: p)
+        }
+        if mode.drawsTrail || mode.companion != nil { requestFramesUnlocked() }
         stateLock.unlock()
     }
 
@@ -562,6 +629,14 @@ private final class MetalOverlayView: NSView {
             }
         }
 
+        if let companion = mode.companion {
+            if catSpawned {
+                appendCatWaypointUnlocked(p, spacing: companion.waypointSpacing)
+            } else {
+                spawnCatUnlocked(at: p)
+            }
+        }
+
         lastPoint = p
         lastSampleTime = now
         let speed01 = min(pointerSpeed / MetalOverlayView.fullWidthSpeed, 1)
@@ -572,10 +647,10 @@ private final class MetalOverlayView: NSView {
             // Absurd event rate: keep the newest sample, drop the previous one.
             pending[pending.count - 1] = TrailPoint(p: p, t: now, speed01: speed01)
         }
-        // With no trail to draw, a sample only matters if it threw a particle.
-        // Waking the display link for the rest would render a frame that draws
-        // nothing, once per mouse event.
-        if mode.drawsTrail || !pendingSpawns.isEmpty { requestFramesUnlocked() }
+        // With no trail to draw, a sample only matters if it threw a particle
+        // or gave the companion somewhere to walk. Waking the display link for
+        // the rest would render a frame that draws nothing, once per event.
+        if mode.drawsTrail || mode.companion != nil || !pendingSpawns.isEmpty { requestFramesUnlocked() }
         stateLock.unlock()
     }
 
@@ -624,6 +699,17 @@ private final class MetalOverlayView: NSView {
         // it would be wrong to keep drawing it with the new mode's physics.
         particles.removeAll()
         ripples.removeAll()
+        // A cat that is still switched on keeps its place and its path: the
+        // menu change was about something else, and having it teleport to the
+        // pointer every time a colour is picked would be a bug with whiskers.
+        if mode.companion == nil, catSpawned {
+            catSpawned = false
+            catPath.removeAll(keepingCapacity: true)
+            catPathHead = 0
+            catLastWaypoint = nil
+            needsClearFrame = true
+            requestFramesUnlocked()
+        }
         emissionCarry = 0
         pendingSpawns.removeAll(keepingCapacity: true)
         pendingRipples.removeAll(keepingCapacity: true)
@@ -633,6 +719,19 @@ private final class MetalOverlayView: NSView {
     func setPalette(_ palette: ParticlePalette) {
         stateLock.lock()
         self.palette = palette
+        stateLock.unlock()
+    }
+
+    func releaseCompanion() {
+        stateLock.lock()
+        if catSpawned {
+            catSpawned = false
+            catPath.removeAll(keepingCapacity: true)
+            catPathHead = 0
+            catLastWaypoint = nil
+            needsClearFrame = true
+            requestFramesUnlocked()
+        }
         stateLock.unlock()
     }
 
@@ -661,18 +760,119 @@ private final class MetalOverlayView: NSView {
 
     @objc private func wakeRenderThread() {}
 
+    /// Caller must hold `stateLock`.
+    private func spawnCatUnlocked(at p: SIMD2<Float>) {
+        catPosition = p
+        catSpawned = true
+        catPath.removeAll(keepingCapacity: true)
+        catPathHead = 0
+        catLastWaypoint = p
+        catIdle = 0
+        catSit = 0
+        catSleep = 0
+        catRun = 0
+        catLastUpdate = 0
+    }
+
+    /// Caller must hold `stateLock`.
+    private func appendCatWaypointUnlocked(_ p: SIMD2<Float>, spacing: Float) {
+        if let last = catLastWaypoint, simd_length_squared(p - last) < spacing * spacing { return }
+        catLastWaypoint = p
+        catPath.append(p)
+        // A pointer that has run a whole display ahead is not a path worth
+        // retracing in full; dropping from the front makes the cat pick the
+        // trail up further along rather than fall further behind for ever.
+        if catPath.count - catPathHead > MetalOverlayView.maxCatWaypoints {
+            catPathHead += 1
+        }
+        if catPathHead > 256 {
+            catPath.removeFirst(catPathHead)
+            catPathHead = 0
+        }
+    }
+
+    /// Caller must hold `stateLock`; runs on the render thread. Walks the cat
+    /// along the queued path, then eases it between running, sitting and
+    /// sleeping. The poses are blends rather than states, so the shader gets a
+    /// cat halfway to sitting and draws exactly that.
+    private func updateCatUnlocked(_ companion: CompanionStyle, nowAbsolute: Double) {
+        guard catSpawned else { return }
+        let dt: Float
+        if catLastUpdate > 0 {
+            // Clamped: a frame after a long pause would otherwise teleport the
+            // cat the whole length of the path in one step.
+            dt = Float(min(max(nowAbsolute - catLastUpdate, 0), 0.1))
+        } else {
+            dt = 1.0 / 60.0
+        }
+        catLastUpdate = nowAbsolute
+
+        // How far there is left to walk sets the pace: a cat that has fallen
+        // behind sprints, so it never strands itself a screen away.
+        var remaining: Float = 0
+        var from = catPosition
+        var i = catPathHead
+        while i < catPath.count {
+            remaining += simd_length(catPath[i] - from)
+            from = catPath[i]
+            i += 1
+        }
+        let speed = min(companion.speed + max(0, remaining - companion.catchRadius) * 3.0, companion.sprintSpeed)
+
+        let before = catPosition
+        var budget = speed * dt
+        while budget > 0, catPathHead < catPath.count {
+            let target = catPath[catPathHead]
+            let delta = target - catPosition
+            let distance = simd_length(delta)
+            if distance <= budget {
+                catPosition = target
+                catPathHead += 1
+                budget -= distance
+            } else {
+                catPosition += delta / distance * budget
+                budget = 0
+            }
+        }
+        if catPathHead > 256 {
+            catPath.removeFirst(catPathHead)
+            catPathHead = 0
+        }
+
+        let step = catPosition - before
+        let moved = simd_length(step)
+        // Turning on any horizontal movement at all makes the cat flip back and
+        // forth on a vertical path; it only turns when it means it.
+        if abs(step.x) > 0.6 { catFacing = step.x > 0 ? 1 : -1 }
+        // The stride is driven by distance, not by time, so the legs stay in
+        // step with the ground whether it is trotting or sprinting.
+        catPhase += moved / 22.0 * .pi
+
+        let walking = moved > 0.35
+        catIdle = walking ? 0 : catIdle + dt
+        approach(&catRun, walking ? 1 : 0, rate: 14, dt: dt)
+        approach(&catSit, catIdle > companion.sitDelay ? 1 : 0, rate: 6, dt: dt)
+        approach(&catSleep, catIdle > companion.sleepDelay ? 1 : 0, rate: 2.2, dt: dt)
+    }
+
+    /// Exponential ease towards a target, framerate-independent enough at the
+    /// rates here, and it never overshoots.
+    private func approach(_ value: inout Float, _ target: Float, rate: Float, dt: Float) {
+        value += (target - value) * min(1, rate * dt)
+    }
+
     /// Caller must hold `stateLock`. `preferredFrameRateRange` is the supported
     /// way to ask for fewer callbacks; unlike skipping frames inside the
     /// callback it lets the system stop waking the render thread at all.
     private func applyTierUnlocked() {
         guard let displayLink else { return }
-        guard tier == .reduced || config.maxFPS > 0 else {
+        guard tier != .full || config.maxFPS > 0 else {
             // Uncapped full rate: ask for nothing and let the link run on the
             // display's own cadence rather than pinning it to a number.
             displayLink.preferredFrameRateRange = .default
             return
         }
-        let fps = tier == .full ? fullFPS : reducedFPS
+        let fps = tier == .full ? fullFPS : (tier == .dozing ? min(reducedFPS, MetalOverlayView.dozeFPS) : reducedFPS)
         displayLink.preferredFrameRateRange = CAFrameRateRange(
             minimum: max(1, fps * 0.5), maximum: fps, preferred: fps
         )
@@ -886,6 +1086,10 @@ private final class MetalOverlayView: NSView {
             ripples.removeAll()
         }
 
+        let companion = mode.companion
+        if let companion { updateCatUnlocked(companion, nowAbsolute: nowAbsolute) }
+        let catVisible = companion != nil && catSpawned
+
         let particleCount = particles.count
         let particleStart = particles.head * 6
         let rippleCount = ripples.count
@@ -894,28 +1098,41 @@ private final class MetalOverlayView: NSView {
         // A frame with no new sample means the pointer has stopped or is
         // crawling; let the average fall so the fade-out settles at half rate.
         if appended == 0 { pointerSpeed *= 0.7 }
-        if particleCount > 0 || rippleCount > 0 {
+        let drawTrail = count >= 2 && mode.drawsTrail
+        // A cat asleep with nothing else on screen is the one case where frames
+        // are still needed but hardly any: it breathes, and that is all.
+        let dozing = catVisible && catSleep > 0.99 && !drawTrail && particleCount == 0 && rippleCount == 0
+        if dozing {
+            if tier != .dozing {
+                tier = .dozing
+                applyTierUnlocked()
+            }
+        } else if particleCount > 0 || rippleCount > 0 {
             // Particles are the one thing on screen that moves independently of
             // the pointer, and sparks cross a display far faster than a pointer
             // ever does. Half rate would strobe them, so hold full rate until
             // the last one dies -- a cost only the particle modes pay.
-            if tier == .reduced {
+            if tier != .full {
                 tier = .full
                 applyTierUnlocked()
             }
-        } else if tier == .full && pointerSpeed < MetalOverlayView.demoteSpeed {
+        } else if tier != .reduced && pointerSpeed < MetalOverlayView.demoteSpeed {
             tier = .reduced
             applyTierUnlocked()
         }
 
-        let drawTrail = count >= 2 && mode.drawsTrail
-        if !drawTrail && particleCount == 0 && rippleCount == 0 {
+        if !drawTrail && particleCount == 0 && rippleCount == 0 && !catVisible {
             // The last frame with a drawable trail had every point at the end of
-            // its life, so it faded to nothing; there is no stale pixel to clear.
-            wantsFrames = false
-            displayLink?.isPaused = true
-            stateLock.unlock()
-            return
+            // its life, so it faded to nothing; there is no stale pixel to clear
+            // -- unless a companion was on screen, which needs one blank frame
+            // presented before the link parks.
+            if !needsClearFrame {
+                wantsFrames = false
+                displayLink?.isPaused = true
+                stateLock.unlock()
+                return
+            }
+            needsClearFrame = false
         }
 
         // Appending shifts tangents for the new points and their predecessor;
@@ -930,6 +1147,19 @@ private final class MetalOverlayView: NSView {
         }
         let vertexStart = points.head * 2
         let now = Float(nowAbsolute - timeOrigin)
+        let catUniforms = catVisible ? CatUniforms(
+            viewport: .zero,
+            position: (catPosition + SIMD2(companion?.sideOffset ?? 0, 0)) * contentScale,
+            size: (companion?.size ?? 0) * contentScale,
+            facing: catFacing,
+            phase: catPhase,
+            run01: catRun,
+            sit01: catSit,
+            sleep01: catSleep,
+            now: now,
+            color: color
+        ) : nil
+        if catVisible { needsClearFrame = true }
         stateLock.unlock()
 
         guard let drawable = metalLayer.nextDrawable(),
@@ -964,6 +1194,16 @@ private final class MetalOverlayView: NSView {
                     softness: passStyle.softness
                 )
             }
+        }
+
+        // After the trail, before the particles: the cat walks over its own
+        // trail, and confetti falls in front of it.
+        if var cat = catUniforms {
+            cat.viewport = viewport
+            encoder.setRenderPipelineState(catPipeline)
+            encoder.setVertexBytes(&cat, length: MemoryLayout<CatUniforms>.stride, index: 1)
+            encoder.setFragmentBytes(&cat, length: MemoryLayout<CatUniforms>.stride, index: 0)
+            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
 
         if particleCount > 0 {
