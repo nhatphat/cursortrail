@@ -71,13 +71,32 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     private static let colorDefaultsKey = "trailColor"
     private static let burstClicksDefaultsKey = "burstClicks"
     private static let paletteDefaultsKey = "particlePalette"
+    private static let confettiAmountDefaultsKey = "confettiAmount"
+    private static let confettiShapeDefaultsKey = "confettiShape"
+    private static let trailFadeDefaultsKey = "trailFade"
+    private static let effectFadeDefaultsKey = "effectFade"
     private static let burstClickChoices = [1, 2, 3]
 
     private let config = TrailConfig()
     private var currentStyle = TrailStyleRegistry.defaultStyle
     private var currentEffectIDs: Set<String> = []
+    /// The two fades are separate settings on purpose: the trail and the
+    /// effects are independent axes everywhere else in the menu, and one
+    /// shared slider would force a compromise on whichever of them you were
+    /// not adjusting.
+    private var currentTrailFade = TrailFadeRegistry.defaultFade
+    private var currentEffectFade = TrailFadeRegistry.defaultFade
+    private var currentConfettiAmount = ConfettiAmountRegistry.defaultAmount
+    private var currentConfettiShape = ConfettiShapeRegistry.defaultShape
+    /// Shape before fade: the fade stretches spin along with the rest of the
+    /// motion, and it is the shape's spin that should be stretched.
     private var currentMode: TrailMode {
-        TrailMode(style: currentStyle, effects: TrailEffectRegistry.effects(ids: currentEffectIDs))
+        TrailMode(
+            style: currentStyle.fading(by: currentTrailFade.scale),
+            effects: TrailEffectRegistry.effects(ids: currentEffectIDs)
+                .map { $0.withConfetti(amount: currentConfettiAmount, shape: currentConfettiShape) }
+                .map { $0.fading(by: currentEffectFade.scale) }
+        )
     }
     private var currentColor = SIMD4<Float>(0, 0, 0, 0)
     private var overlays: [OverlayController] = []
@@ -93,6 +112,14 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
     private var burstClicksMenuItems: [NSMenuItem] = []
     private var burstNoteItem: NSMenuItem?
     private var paletteMenuItems: [String: NSMenuItem] = [:]
+    private var confettiAmountMenuItems: [String: NSMenuItem] = [:]
+    private var confettiShapeMenuItems: [String: NSMenuItem] = [:]
+    private var confettiAmountNoteItem: NSMenuItem?
+    private var confettiShapeNoteItem: NSMenuItem?
+    private var trailFadeMenuItems: [String: NSMenuItem] = [:]
+    private var effectFadeMenuItems: [String: NSMenuItem] = [:]
+    private var trailFadeNoteItem: NSMenuItem?
+    private var effectFadeNoteItem: NSMenuItem?
     private var pauseMenuItem: NSMenuItem?
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
@@ -122,6 +149,10 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         // picked from the menu bar has been chosen more deliberately.
         currentColor = Self.decodeColor(UserDefaults.standard.string(forKey: Self.colorDefaultsKey)) ?? config.color
         currentPalette = ParticlePaletteRegistry.palette(id: UserDefaults.standard.string(forKey: Self.paletteDefaultsKey))
+        currentConfettiAmount = ConfettiAmountRegistry.amount(id: UserDefaults.standard.string(forKey: Self.confettiAmountDefaultsKey))
+        currentConfettiShape = ConfettiShapeRegistry.shape(id: UserDefaults.standard.string(forKey: Self.confettiShapeDefaultsKey))
+        currentTrailFade = TrailFadeRegistry.fade(id: UserDefaults.standard.string(forKey: Self.trailFadeDefaultsKey))
+        currentEffectFade = TrailFadeRegistry.fade(id: UserDefaults.standard.string(forKey: Self.effectFadeDefaultsKey))
         let storedClicks = UserDefaults.standard.integer(forKey: Self.burstClicksDefaultsKey)
         currentBurstClicks = Self.burstClickChoices.contains(storedClicks)
             ? storedClicks
@@ -221,9 +252,25 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         paletteItem.submenu = buildPaletteMenu()
         menu.addItem(paletteItem)
 
+        let confettiAmountItem = NSMenuItem(title: "Confetti Amount", action: nil, keyEquivalent: "")
+        confettiAmountItem.submenu = buildConfettiAmountMenu()
+        menu.addItem(confettiAmountItem)
+
+        let confettiShapeItem = NSMenuItem(title: "Confetti Shape", action: nil, keyEquivalent: "")
+        confettiShapeItem.submenu = buildConfettiShapeMenu()
+        menu.addItem(confettiShapeItem)
+
         let burstItem = NSMenuItem(title: "Firework Clicks", action: nil, keyEquivalent: "")
         burstItem.submenu = buildBurstMenu()
         menu.addItem(burstItem)
+
+        let trailFadeItem = NSMenuItem(title: "Trail Fade", action: nil, keyEquivalent: "")
+        trailFadeItem.submenu = buildTrailFadeMenu()
+        menu.addItem(trailFadeItem)
+
+        let effectFadeItem = NSMenuItem(title: "Effect Fade", action: nil, keyEquivalent: "")
+        effectFadeItem.submenu = buildEffectFadeMenu()
+        menu.addItem(effectFadeItem)
 
         menu.addItem(.separator())
         let pause = NSMenuItem(title: "Pause Trail", action: #selector(togglePause), keyEquivalent: "t")
@@ -242,6 +289,141 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         refreshColorChecks()
         refreshBurstChecks()
         refreshPaletteChecks()
+        refreshFadeChecks()
+        refreshConfettiChecks()
+    }
+
+    private func buildConfettiAmountMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let note = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        note.isHidden = true
+        menu.addItem(note)
+        confettiAmountNoteItem = note
+
+        for amount in ConfettiAmountRegistry.all {
+            let item = NSMenuItem(title: amount.title, action: #selector(selectConfettiAmount(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = amount.id
+            menu.addItem(item)
+            confettiAmountMenuItems[amount.id] = item
+        }
+        return menu
+    }
+
+    private func buildConfettiShapeMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let note = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        note.isHidden = true
+        menu.addItem(note)
+        confettiShapeNoteItem = note
+
+        for shape in ConfettiShapeRegistry.all {
+            let item = NSMenuItem(title: shape.title, action: #selector(selectConfettiShape(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = shape.id
+            menu.addItem(item)
+            confettiShapeMenuItems[shape.id] = item
+        }
+        return menu
+    }
+
+    @objc private func selectConfettiAmount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        currentConfettiAmount = ConfettiAmountRegistry.amount(id: id)
+        UserDefaults.standard.set(currentConfettiAmount.id, forKey: Self.confettiAmountDefaultsKey)
+        applySelection()
+    }
+
+    @objc private func selectConfettiShape(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        currentConfettiShape = ConfettiShapeRegistry.shape(id: id)
+        UserDefaults.standard.set(currentConfettiShape.id, forKey: Self.confettiShapeDefaultsKey)
+        applySelection()
+    }
+
+    private func refreshConfettiChecks() {
+        for (id, item) in confettiAmountMenuItems {
+            item.state = (id == currentConfettiAmount.id) ? .on : .off
+        }
+        for (id, item) in confettiShapeMenuItems {
+            item.state = (id == currentConfettiShape.id) ? .on : .off
+        }
+        let hasConfetti = currentEffectIDs.contains("confetti")
+        for note in [confettiAmountNoteItem, confettiShapeNoteItem] {
+            note?.isHidden = hasConfetti
+            note?.title = "Turn on Confetti to use this"
+        }
+    }
+
+    private func buildTrailFadeMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let note = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        note.isHidden = true
+        menu.addItem(note)
+        trailFadeNoteItem = note
+
+        for fade in TrailFadeRegistry.all {
+            let item = NSMenuItem(title: fade.title, action: #selector(selectTrailFade(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = fade.id
+            menu.addItem(item)
+            trailFadeMenuItems[fade.id] = item
+        }
+        return menu
+    }
+
+    private func buildEffectFadeMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        let note = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        note.isHidden = true
+        menu.addItem(note)
+        effectFadeNoteItem = note
+
+        for fade in TrailFadeRegistry.all {
+            let item = NSMenuItem(title: fade.title, action: #selector(selectEffectFade(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = fade.id
+            menu.addItem(item)
+            effectFadeMenuItems[fade.id] = item
+        }
+        return menu
+    }
+
+    @objc private func selectTrailFade(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        currentTrailFade = TrailFadeRegistry.fade(id: id)
+        UserDefaults.standard.set(currentTrailFade.id, forKey: Self.trailFadeDefaultsKey)
+        applySelection()
+    }
+
+    @objc private func selectEffectFade(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        currentEffectFade = TrailFadeRegistry.fade(id: id)
+        UserDefaults.standard.set(currentEffectFade.id, forKey: Self.effectFadeDefaultsKey)
+        applySelection()
+    }
+
+    private func refreshFadeChecks() {
+        for (id, item) in trailFadeMenuItems {
+            item.state = (id == currentTrailFade.id) ? .on : .off
+        }
+        for (id, item) in effectFadeMenuItems {
+            item.state = (id == currentEffectFade.id) ? .on : .off
+        }
+        // Same courtesy the colour and firework submenus pay: say why the
+        // setting is doing nothing rather than letting it look broken.
+        trailFadeNoteItem?.isHidden = currentMode.drawsTrail
+        trailFadeNoteItem?.title = "Trail Style is None"
+        effectFadeNoteItem?.isHidden = !currentEffectIDs.isEmpty
+        effectFadeNoteItem?.title = "Turn on an effect to use this"
     }
 
     private func buildPaletteMenu() -> NSMenu {
@@ -440,6 +622,8 @@ final class CursorTrailApp: NSObject, NSApplicationDelegate {
         refreshColorChecks()
         refreshBurstChecks()
         refreshPaletteChecks()
+        refreshFadeChecks()
+        refreshConfettiChecks()
     }
 
     private func refreshModeChecks() {

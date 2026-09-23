@@ -140,6 +140,10 @@ struct ParticleVertex {
     /// Non-zero squashes the quad across its spin, so a confetto reads as a
     /// flat piece of paper flipping over rather than a badge rotating.
     float flutter;
+    /// Width as a fraction of length. 1 is the square quad every particle used
+    /// to be; below that the piece is a ribbon, and because the mask below
+    /// works in the same unit square, the drawn shape narrows with it.
+    float aspect;
 };
 
 struct ParticleUniforms {
@@ -175,9 +179,10 @@ vertex ParticleRasterOut particleVertex(
     float ca = cos(angle);
     float sa = sin(angle);
     float2 c = v.corner;
-    // Squash across the spin axis first, then rotate, so the flutter reads as
-    // the sheet turning edge-on rather than as the quad being scaled.
-    c.x *= mix(1.0, ca, v.flutter);
+    // Narrow the quad, then squash across the spin axis, then rotate, so the
+    // flutter reads as the sheet turning edge-on rather than as the quad being
+    // scaled -- and so a ribbon tumbles about its long axis like paper.
+    c.x *= v.aspect * mix(1.0, ca, v.flutter);
     float2 rotated = float2(c.x * ca - c.y * sa, c.x * sa + c.y * ca);
 
     float scale = v.size * (1.0 - 0.35 * age01);
