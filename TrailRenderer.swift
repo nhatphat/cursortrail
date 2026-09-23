@@ -53,6 +53,7 @@ private struct ParticleVertex {
     var lifetime: Float
     var roundness: Float
     var flutter: Float
+    var aspect: Float
 }
 
 /// Mirrors `RippleVertex` in Trail.metal.
@@ -519,7 +520,7 @@ private final class MetalOverlayView: NSView {
         lastSampleTime = now
         let physical = points.append(TrailPoint(p: p, t: now))
         writeVertexPair(logicalIndex: 0, physicalIndex: physical)
-        requestFramesUnlocked()
+        if mode.drawsTrail { requestFramesUnlocked() }
         stateLock.unlock()
     }
 
@@ -571,7 +572,10 @@ private final class MetalOverlayView: NSView {
             // Absurd event rate: keep the newest sample, drop the previous one.
             pending[pending.count - 1] = TrailPoint(p: p, t: now, speed01: speed01)
         }
-        requestFramesUnlocked()
+        // With no trail to draw, a sample only matters if it threw a particle.
+        // Waking the display link for the rest would render a frame that draws
+        // nothing, once per mouse event.
+        if mode.drawsTrail || !pendingSpawns.isEmpty { requestFramesUnlocked() }
         stateLock.unlock()
     }
 
@@ -789,7 +793,8 @@ private final class MetalOverlayView: NSView {
                     gravity: style.gravity * contentScale,
                     lifetime: style.lifetime,
                     roundness: style.roundness,
-                    flutter: style.flutter ? 1 : 0
+                    flutter: style.flutter ? 1 : 0,
+                    aspect: style.aspect
                 )
 
                 let base = physical * 6
@@ -903,7 +908,7 @@ private final class MetalOverlayView: NSView {
             applyTierUnlocked()
         }
 
-        let drawTrail = count >= 2
+        let drawTrail = count >= 2 && mode.drawsTrail
         if !drawTrail && particleCount == 0 && rippleCount == 0 {
             // The last frame with a drawable trail had every point at the end of
             // its life, so it faded to nothing; there is no stale pixel to clear.

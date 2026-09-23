@@ -87,7 +87,7 @@ Remove it with:
 
 Choose them from the menu bar icon. Selections are stored in `UserDefaults` and restored on the next launch.
 
-CursorTrail has two independent axes, and the menu bar reflects that: **Trail Style** is a single choice, **Effects** are checks. Any style combines with any set of effects.
+CursorTrail has two independent axes, and the menu bar reflects that: **Trail Style** is a single choice, **Effects** are checks. Any style combines with any set of effects — including **None**, which draws no trail at all and leaves you with only the effects you switched on.
 
 Styles:
 
@@ -98,6 +98,7 @@ Styles:
 | **Rainbow Road** | hues sweep down the trail and scroll over time | 3 | its own |
 | **Gradient** | your colour at the head, fading into a hue-rotated tail | 2 | your colour |
 | **Blur** | a wide, diffuse smudge with no hard edge | 5 | your colour |
+| **None** | no trail; only the checked effects are drawn | 0 | — |
 
 Effects:
 
@@ -109,6 +110,8 @@ Effects:
 
 **Blur** has no separate blur pass. Stacking wide, fully soft, nearly transparent strips over each other sums to the same falloff, and each extra pass is one more `drawPrimitives` on a vertex buffer that is already bound — no second render target, no read-back.
 
+**None** carries no passes, and the renderer treats that as "skip the trail" rather than drawing an empty one: the pointer is still sampled, because **Confetti** emits along its path, but a sample that throws no particle no longer wakes the display link either.
+
 **Rainbow Road** picks its hue from how far down the trail a fragment sits, so the pattern is anchored to the pointer and scrolls with time rather than with position on screen. **Gradient** derives its tail colour by rotating your chosen colour's hue; pick a near-grey and it lifts the saturation so the tail is still a visibly different colour.
 
 ## Trail width follows pointer speed
@@ -119,11 +122,31 @@ The trail is thin where the pointer was crawling and fuller where it was flickin
 
 **Confetti** emits along the pointer's path — one piece per 14 points of travel, so the spacing is a property of the path rather than of the event rate: a slow drag does not carpet the screen and a flick does not leave gaps. **Firework** throws 72 sparks radially from wherever you click. **Click Ripple** sends out three rings, each launched a little after the one before, so they chase each other outward the way a stone dropped in water sends them. Each expands quickly and then eases off, fading as it goes, and later waves start fainter so the first stays the leading edge. The quad does not grow: it is fixed at the largest radius and the fragment decides where every ring is, which is what lets one quad carry a whole train of waves instead of one ring each.
 
+Confetti's density and shape are chosen from the menu bar — see [Confetti amount and shape](#confetti-amount-and-shape).
+
 A particle's whole path is decided the moment it spawns, so its six vertices are written once and never touched again; position, rotation and fade are evaluated from the vertex's age in the vertex shader. This is the same trick the trail uses for its fade, for the same reason — the CPU does no per-frame particle work, and a frame drawing hundreds of particles is one draw call with no buffer traffic. Ripples work the same way and share the particle uniforms. Motion is ballistic with no drag term: drag has no closed form this cheap, and at these speeds nobody can tell it is missing.
 
 Physics rides on the particle rather than in the uniforms, which is what lets several effects with different lifetimes, gravity and shape be drawn together in one call.
 
 Gravity is well under the real thing. At anything like a realistic value the confetti drops some 600 points inside its lifetime — more than half a display — and reads as being sucked downward rather than fluttering.
+
+## Confetti amount and shape
+
+Two more submenus, both confetti's own. **Confetti Amount** runs **Very Sparse**, **Sparse**, **Normal**, **Dense**, **Very Dense** — a 0.33x to 3.3x multiplier on density, which the emitter reads back as a shorter gap between pieces. Density rather than a piece count, because emission is per point of pointer travel: a denser setting still does not carpet the screen when the pointer crawls. Past **Dense** a fast flick can out-run the 512-particle ring, which then reclaims the oldest piece still in the air — a denser stream at the pointer, a shorter one behind it.
+
+**Confetti Shape** offers **Paper** (the original: near-square, fluttering), **Dots**, **Ribbons** and **Bubbles**. A shape is four numbers on the particle — size, roundness, aspect and flutter — plus the spin that goes with it, so none of them is a new geometry path in the shader. **Ribbons** narrows the quad to roughly a quarter of its length; the fragment masks the same unit square either way, so the drawn piece narrows with the geometry, and the flutter turning it edge-on as it tumbles is most of what sells it. **Dots** and **Bubbles** do not spin at all, because a disc rotating about its centre is still the same disc.
+
+Both settings reach the movement emitters only. A firework is sparks, and sparks stay the points their own effect asked for.
+
+## Fade duration
+
+Two submenus, **Trail Fade** and **Effect Fade**, each offer **Very Short**, **Short**, **Normal**, **Long** and **Very Long** — multipliers of 0.4x to 2.25x on the timings every style and effect was tuned with. They are separate settings because the trail and the effects are independent axes everywhere else too: a long trail with snappy confetti is a combination worth having, and one shared control would be wrong for whichever of the two you were not adjusting. Both are stored in `UserDefaults` and restored next launch.
+
+**Trail Fade** moves the style's lifetime and nothing else — width and colour are the style's identity, so a longer fade is the same trail kept on screen longer. Even at 2.25x the longest style stays inside the 256-sample point ring, so no tail is clipped.
+
+Shape is applied before the fade, so it is the shape's own spin that the fade stretches.
+
+**Effect Fade** stretches time rather than lifetime alone. Dividing a particle's speed by the scale and its gravity by the square puts it at `scale * t` exactly where it used to be at `t`, so a burst keeps the size and shape it was tuned with and only its pace changes; scaling the lifetime by itself would instead throw confetti four times as far for a doubled fade, which reads as a different effect rather than a slower one. Ripples scale their wave lifetime and the delay between waves together, so the train keeps its spacing and still reaches the same radius.
 
 ## Particle colours
 
